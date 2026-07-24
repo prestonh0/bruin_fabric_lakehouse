@@ -16,8 +16,11 @@ import (
 // Asset types provided by this connector. These are the values used in the
 // `type` field of bruin asset definitions.
 const (
-	AssetTypeFabricSparkQuery   = pipeline.AssetType("fabric.spark.sql")
-	AssetTypeFabricSparkPySpark = pipeline.AssetType("fabric.spark.pyspark")
+	AssetTypeFabricSparkQuery       = pipeline.AssetType("fabric.spark.sql")
+	AssetTypeFabricSparkPySpark     = pipeline.AssetType("fabric.spark.pyspark")
+	AssetTypeFabricSparkSeed        = pipeline.AssetType("fabric.spark.seed")
+	AssetTypeFabricSparkQuerySensor = pipeline.AssetType("fabric.spark.sensor.query")
+	AssetTypeFabricSparkTableSensor = pipeline.AssetType("fabric.spark.sensor.table")
 )
 
 type materializer interface {
@@ -88,7 +91,11 @@ func (o BasicOperator) RunTask(ctx context.Context, p *pipeline.Pipeline, t *pip
 		return err
 	}
 
-	if t.Materialization.Strategy == pipeline.MaterializationStrategyTimeInterval {
+	// Both time_interval and window-bounded anti_join emit {{start_*}} /
+	// {{end_*}} placeholders that must be rendered against the run window.
+	needsWindowRendering := t.Materialization.Strategy == pipeline.MaterializationStrategyTimeInterval ||
+		(t.Materialization.Strategy == MaterializationStrategyAntiJoin && t.Materialization.IncrementalKey != "")
+	if needsWindowRendering {
 		materializedQueries, err = extractor.ReextractQueriesFromSlice(materializedQueries)
 		if err != nil {
 			return err

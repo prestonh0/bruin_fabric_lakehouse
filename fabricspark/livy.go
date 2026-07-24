@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -39,11 +40,32 @@ const (
 	statementStateCancelling = "cancelling"
 )
 
+// FlexibleID decodes an identifier that Fabric returns sometimes as a JSON
+// number and sometimes as a string (HC session ids are string GUIDs).
+type FlexibleID string
+
+// UnmarshalJSON accepts both `"abc"` and `123`.
+func (f *FlexibleID) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*f = FlexibleID(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	*f = FlexibleID(n.String())
+	return nil
+}
+
+func (f FlexibleID) String() string { return string(f) }
+
 // LivySession is the subset of the Livy session resource the connector needs.
 type LivySession struct {
-	ID    json.Number `json:"id"`
-	State string      `json:"state"`
-	AppID string      `json:"appId"`
+	ID    FlexibleID `json:"id"`
+	State string     `json:"state"`
+	AppID string     `json:"appId"`
 }
 
 // IDString normalizes the session ID, which Fabric returns as a number or a string.
@@ -53,7 +75,7 @@ func (s *LivySession) IDString() string {
 
 // LivyStatement is a single code statement executed inside a session.
 type LivyStatement struct {
-	ID     json.Number      `json:"id"`
+	ID     FlexibleID       `json:"id"`
 	State  string           `json:"state"`
 	Output *StatementOutput `json:"output"`
 }
@@ -318,8 +340,14 @@ func sanitizeSQL(sql string) string {
 
 // SubmitStatement submits code to a session and returns the statement handle.
 func (c *LivyClient) SubmitStatement(ctx context.Context, sessionID, code, kind string) (*LivyStatement, error) {
+	return c.submitStatementAt(ctx, "/sessions/"+sessionID+"/statements", code, kind)
+}
+
+// submitStatementAt submits code to any statements collection — the singleton
+// session path or a high-concurrency REPL path.
+func (c *LivyClient) submitStatementAt(ctx context.Context, statementsPath, code, kind string) (*LivyStatement, error) {
 	payload := map[string]any{"code": code, "kind": kind}
-	body, status, err := c.doRequest(ctx, http.MethodPost, "/sessions/"+sessionID+"/statements", payload)
+	body, status, err := c.doRequest(ctx, http.MethodPost, statementsPath, payload)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to submit statement to Fabric Spark session")
 	}
@@ -357,12 +385,18 @@ func (e *StatementSubmitError) SessionGone() bool {
 // A statement that finishes with an error state produces a descriptive error
 // including the Spark evalue and traceback.
 func (c *LivyClient) WaitForStatement(ctx context.Context, sessionID, statementID string) (*StatementOutput, error) {
+	return c.waitForStatementAt(ctx, "/sessions/"+sessionID+"/statements", statementID)
+}
+
+// waitForStatementAt polls a statement in any statements collection until it
+// completes.
+func (c *LivyClient) waitForStatementAt(ctx context.Context, statementsPath, statementID string) (*StatementOutput, error) {
 	var deadline time.Time
 	if c.statementTimeout > 0 {
 		deadline = time.Now().Add(c.statementTimeout)
 	}
 
-	path := "/sessions/" + sessionID + "/statements/" + statementID
+	path := statementsPath + "/" + statementID
 	pollWait := c.pollInterval
 	notFoundRetries := 0
 
@@ -380,7 +414,7 @@ func (c *LivyClient) WaitForStatement(ctx context.Context, sessionID, statementI
 		if status == http.StatusNotFound {
 			notFoundRetries++
 			if notFoundRetries > 20 {
-				return nil, fmt.Errorf("statement %s disappeared from Fabric Spark session %s", statementID, sessionID)
+				return nil, fmt.Errorf("statement %s disappeared from the Fabric Spark session (%s)", statementID, statementsPath)
 			}
 			select {
 			case <-ctx.Done():
@@ -426,9 +460,20 @@ func statementResult(statement *LivyStatement) (*StatementOutput, error) {
 	return statement.Output, nil
 }
 
+// StatementFailedError marks a statement that executed but failed inside
+// Spark (analysis error, runtime exception). The session/REPL that ran it is
+// still healthy — callers pooling sessions can keep reusing it.
+type StatementFailedError struct {
+	Message string
+}
+
+func (e *StatementFailedError) Error() string {
+	return e.Message
+}
+
 func statementError(statement *LivyStatement) error {
 	if statement.Output == nil {
-		return fmt.Errorf("statement %s finished in state %q without output", statement.ID.String(), statement.State)
+		return &StatementFailedError{Message: fmt.Sprintf("statement %s finished in state %q without output", statement.ID.String(), statement.State)}
 	}
 
 	message := statement.Output.EValue
@@ -443,9 +488,9 @@ func statementError(statement *LivyStatement) error {
 		if len(traceback) > 2048 {
 			traceback = traceback[:2048] + "..."
 		}
-		return fmt.Errorf("fabric Spark statement failed: %s\n%s", message, traceback)
+		return &StatementFailedError{Message: fmt.Sprintf("fabric Spark statement failed: %s\n%s", message, traceback)}
 	}
-	return fmt.Errorf("fabric Spark statement failed: %s", message)
+	return &StatementFailedError{Message: "fabric Spark statement failed: " + message}
 }
 
 // ParseSQLOutput extracts the tabular result of a SQL statement.
@@ -485,4 +530,132 @@ func ParseTextOutput(output *StatementOutput) string {
 		return string(raw)
 	}
 	return text
+}
+
+// --- High-concurrency sessions ---------------------------------------------
+//
+// Fabric's /highConcurrencySessions endpoint packs multiple REPLs onto a
+// single Spark application, keyed by a shared sessionTag. Statements
+// submitted to different REPLs execute concurrently inside that application,
+// which is how parallel bruin assets avoid queueing on one interpreter.
+
+// HCSession is one acquired REPL inside a shared high-concurrency Spark
+// application.
+type HCSession struct {
+	// HCID is the acquire handle, used for release.
+	HCID string
+	// SessionID is the underlying Livy session hosting the REPLs.
+	SessionID string
+	// ReplID identifies this REPL for statement submission.
+	ReplID string
+}
+
+func (s *HCSession) statementsPath() string {
+	return "/highConcurrencySessions/" + s.SessionID + "/repls/" + s.ReplID + "/statements"
+}
+
+type hcSessionState struct {
+	ID        FlexibleID `json:"id"`
+	State     string     `json:"state"`
+	SessionID string     `json:"sessionId"`
+	ReplID    string     `json:"replId"`
+
+	FabricSessionStateInfo struct {
+		ErrorMessage string `json:"errorMessage"`
+	} `json:"fabricSessionStateInfo"`
+}
+
+// AcquireHCSession acquires a REPL via POST /highConcurrencySessions and
+// waits until Fabric reports it Idle with a sessionId and replId assigned.
+// The payload must carry the sessionTag; acquires sharing a tag are packed
+// onto the same Spark application.
+func (c *LivyClient) AcquireHCSession(ctx context.Context, payload map[string]any) (*HCSession, error) {
+	body, status, err := c.doRequest(ctx, http.MethodPost, "/highConcurrencySessions", payload)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to acquire Fabric high-concurrency session")
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("failed to acquire Fabric high-concurrency session (HTTP %d): %s", status, summarizeBody(body))
+	}
+
+	var state hcSessionState
+	if err := json.Unmarshal(body, &state); err != nil {
+		return nil, errors.Wrap(err, "failed to decode high-concurrency session response")
+	}
+	hcID := state.ID.String()
+	if hcID == "" {
+		return nil, fmt.Errorf("high-concurrency acquire response did not contain an id: %s", summarizeBody(body))
+	}
+
+	return c.waitForHCSessionIdle(ctx, hcID)
+}
+
+func (c *LivyClient) waitForHCSessionIdle(ctx context.Context, hcID string) (*HCSession, error) {
+	deadline := time.Now().Add(c.sessionStartTimeout)
+	pollWait := 2 * time.Second
+
+	for {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out after %s waiting for high-concurrency session %s to become idle; increase `session_start_timeout_seconds` or check capacity availability", c.sessionStartTimeout, hcID)
+		}
+
+		body, status, err := c.doRequest(ctx, http.MethodGet, "/highConcurrencySessions/"+hcID, nil)
+		if err != nil {
+			return nil, err
+		}
+		if status >= 400 {
+			return nil, fmt.Errorf("failed to poll high-concurrency session %s (HTTP %d): %s", hcID, status, summarizeBody(body))
+		}
+
+		var state hcSessionState
+		if err := json.Unmarshal(body, &state); err != nil {
+			return nil, errors.Wrap(err, "failed to decode high-concurrency session poll response")
+		}
+
+		switch strings.ToLower(state.State) {
+		case sessionStateIdle:
+			if state.SessionID != "" && state.ReplID != "" {
+				return &HCSession{HCID: hcID, SessionID: state.SessionID, ReplID: state.ReplID}, nil
+			}
+		case sessionStateDead, sessionStateError, sessionStateKilled, sessionStateShuttingDown, "cancelled", "failed":
+			message := state.FabricSessionStateInfo.ErrorMessage
+			if message == "" {
+				message = state.State
+			}
+			return nil, fmt.Errorf("fabric high-concurrency session %s failed to start: %s", hcID, message)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pollWait):
+		}
+		if pollWait < 10*time.Second {
+			pollWait += time.Second
+		}
+	}
+}
+
+// SubmitHCStatement submits code to a high-concurrency REPL.
+func (c *LivyClient) SubmitHCStatement(ctx context.Context, session *HCSession, code, kind string) (*LivyStatement, error) {
+	return c.submitStatementAt(ctx, session.statementsPath(), code, kind)
+}
+
+// WaitForHCStatement polls a high-concurrency REPL statement to completion.
+func (c *LivyClient) WaitForHCStatement(ctx context.Context, session *HCSession, statementID string) (*StatementOutput, error) {
+	return c.waitForStatementAt(ctx, session.statementsPath(), statementID)
+}
+
+// ReleaseHCSession releases one REPL acquire. The underlying Spark
+// application keeps serving any other REPLs in the same packing group and is
+// reaped by Fabric on idle timeout.
+func (c *LivyClient) ReleaseHCSession(ctx context.Context, hcID string) error {
+	body, status, err := c.doRequest(ctx, http.MethodDelete, "/highConcurrencySessions/"+hcID, nil)
+	if err != nil {
+		return err
+	}
+	if status >= 400 && status != http.StatusNotFound {
+		return fmt.Errorf("failed to release high-concurrency session %s (HTTP %d): %s", hcID, status, summarizeBody(body))
+	}
+	return nil
 }

@@ -107,5 +107,23 @@ func TestConfigLivyEndpoint(t *testing.T) {
 
 func TestConfigGetIngestrURI(t *testing.T) {
 	t.Parallel()
+
+	// Without a workspace name there is no ingestr mapping.
 	assert.Equal(t, "", validConfig().GetIngestrURI())
+
+	// Static-token auth cannot be forwarded to ingestr.
+	c := validConfig()
+	c.WorkspaceName = "Analytics"
+	c.TenantID, c.ClientID, c.ClientSecret = "", "", ""
+	c.AccessToken = "token"
+	assert.Equal(t, "", c.GetIngestrURI())
+
+	// Service principal + workspace name yields the OneLake destination URI.
+	c = validConfig()
+	c.WorkspaceName = "Analytics"
+	uri := c.GetIngestrURI()
+	assert.Contains(t, uri, "onelake://Analytics/my_lakehouse?")
+	assert.Contains(t, uri, "client_id=client-id")
+	assert.Contains(t, uri, "client_secret=client-secret")
+	assert.Contains(t, uri, "tenant_id=99999999-8888-7777-6666-555555555555")
 }

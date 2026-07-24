@@ -195,7 +195,50 @@ func TestMaterializerRender(t *testing.T) {
 			},
 		},
 		{
-			name: "incremental scd2 not supported",
+			name: "anti join requires primary key",
+			asset: &pipeline.Asset{
+				Name: "reporting.orders",
+				Materialization: pipeline.Materialization{
+					Type:     pipeline.MaterializationTypeTable,
+					Strategy: MaterializationStrategyAntiJoin,
+				},
+				Columns: []pipeline.Column{{Name: "order_id"}},
+			},
+			query:   "SELECT 1",
+			wantErr: "primary_key",
+		},
+		{
+			name: "anti join with incremental key requires granularity",
+			asset: &pipeline.Asset{
+				Name: "reporting.orders",
+				Materialization: pipeline.Materialization{
+					Type:           pipeline.MaterializationTypeTable,
+					Strategy:       MaterializationStrategyAntiJoin,
+					IncrementalKey: "order_ts",
+				},
+				Columns: []pipeline.Column{{Name: "order_id", PrimaryKey: true}},
+			},
+			query:   "SELECT 1",
+			wantErr: "time_granularity",
+		},
+		{
+			name: "full refresh flips anti join to create+replace",
+			asset: &pipeline.Asset{
+				Name: "reporting.orders",
+				Materialization: pipeline.Materialization{
+					Type:     pipeline.MaterializationTypeTable,
+					Strategy: MaterializationStrategyAntiJoin,
+				},
+				Columns: []pipeline.Column{{Name: "order_id", PrimaryKey: true}},
+			},
+			query:       "SELECT * FROM raw.orders",
+			fullRefresh: true,
+			want: []string{
+				"CREATE OR REPLACE TABLE reporting.orders\nAS SELECT * FROM raw.orders",
+			},
+		},
+		{
+			name: "incremental scd2 requires primary key",
 			asset: &pipeline.Asset{
 				Name: "reporting.users",
 				Materialization: pipeline.Materialization{
@@ -204,7 +247,7 @@ func TestMaterializerRender(t *testing.T) {
 				},
 			},
 			query:   "SELECT 1",
-			wantErr: "--full-refresh",
+			wantErr: "primary_key",
 		},
 		{
 			name: "full refresh flips delete+insert to create+replace",
@@ -262,6 +305,65 @@ func TestMaterializerRenderDeleteInsertShape(t *testing.T) {
 	assert.Contains(t, got[1], "DELETE FROM reporting.events WHERE dt IN (SELECT DISTINCT dt FROM __bruin_tmp_")
 	assert.Contains(t, got[2], "INSERT INTO reporting.events SELECT * FROM __bruin_tmp_")
 	assert.True(t, strings.HasPrefix(got[3], "DROP VIEW IF EXISTS __bruin_tmp_"))
+}
+
+func TestMaterializerRenderAntiJoinCompoundKey(t *testing.T) {
+	t.Parallel()
+
+	asset := &pipeline.Asset{
+		Name: "reporting.orders",
+		Materialization: pipeline.Materialization{
+			Type:     pipeline.MaterializationTypeTable,
+			Strategy: MaterializationStrategyAntiJoin,
+		},
+		Columns: []pipeline.Column{
+			{Name: "source_system", PrimaryKey: true},
+			{Name: "order_number", PrimaryKey: true},
+			{Name: "amount"},
+		},
+	}
+
+	got, err := NewMaterializer(false).Render(asset, "SELECT * FROM staging.orders")
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	assert.True(t, strings.HasPrefix(got[0], "CREATE OR REPLACE TEMPORARY VIEW __bruin_tmp_"))
+	assert.Contains(t, got[0], "SELECT * FROM staging.orders")
+
+	// The insert must anti-join on BOTH business-key columns, null-safe, and
+	// only project the key columns from the target.
+	assert.Contains(t, got[1], "INSERT INTO reporting.orders")
+	assert.Contains(t, got[1], "LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders) tgt")
+	assert.Contains(t, got[1], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
+
+	assert.True(t, strings.HasPrefix(got[2], "DROP VIEW IF EXISTS __bruin_tmp_"))
+}
+
+func TestMaterializerRenderAntiJoinWindowBounded(t *testing.T) {
+	t.Parallel()
+
+	asset := &pipeline.Asset{
+		Name: "reporting.orders",
+		Materialization: pipeline.Materialization{
+			Type:            pipeline.MaterializationTypeTable,
+			Strategy:        MaterializationStrategyAntiJoin,
+			IncrementalKey:  "order_ts",
+			TimeGranularity: pipeline.MaterializationTimeGranularityTimestamp,
+		},
+		Columns: []pipeline.Column{
+			{Name: "source_system", PrimaryKey: true},
+			{Name: "order_number", PrimaryKey: true},
+		},
+	}
+
+	got, err := NewMaterializer(false).Render(asset, "SELECT * FROM staging.orders")
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	// The target scan is bounded to the run window with the same
+	// placeholders time_interval uses.
+	assert.Contains(t, got[1],
+		"LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders WHERE order_ts BETWEEN '{{start_timestamp}}' AND '{{end_timestamp}}') tgt")
 }
 
 func TestRendererJoinsStatements(t *testing.T) {

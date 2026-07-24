@@ -43,6 +43,9 @@ var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 type Config struct {
 	// WorkspaceID is the Fabric workspace GUID that contains the lakehouse.
 	WorkspaceID string
+	// WorkspaceName is the workspace display name; only needed for ingestr
+	// integration, where the OneLake URI is name-based.
+	WorkspaceName string
 	// LakehouseID is the lakehouse item GUID.
 	LakehouseID string
 	// LakehouseName is the display name of the lakehouse; it doubles as the
@@ -72,6 +75,20 @@ type Config struct {
 	// SparkConfig holds extra spark conf key/values applied to the session,
 	// e.g. {"spark.sql.caseSensitive": "true"}.
 	SparkConfig map[string]string
+
+	// HighConcurrency switches the connection to Fabric's
+	// /highConcurrencySessions API: multiple REPLs are packed onto one Spark
+	// application and parallel assets execute concurrently instead of
+	// queueing on a single interpreter.
+	HighConcurrency bool
+	// SessionTag is the packing key for high-concurrency REPLs; acquires
+	// sharing a tag land on the same Spark application. Defaults to a random
+	// per-process tag. Set it explicitly to share one application across
+	// bruin invocations while it stays warm.
+	SessionTag string
+	// MaxConcurrentREPLs caps how many REPLs this connection acquires in
+	// high-concurrency mode. Default 4.
+	MaxConcurrentREPLs int
 
 	// HTTPTimeoutSeconds bounds each HTTP call to the Fabric API. Default 120.
 	HTTPTimeoutSeconds int
@@ -136,9 +153,22 @@ func (c *Config) LivyEndpoint() string {
 	return fmt.Sprintf("%s/workspaces/%s/lakehouses/%s/livyapi/versions/%s", endpoint, c.WorkspaceID, c.LakehouseID, LivyAPIVersion)
 }
 
-// GetIngestrURI implements the interface bruin uses to detect ingestr
-// support. The Fabric Livy API has no ingestr counterpart, so this returns an
-// empty string.
+// GetIngestrURI maps the connection onto ingestr's OneLake destination, so
+// the same lakehouse this connector transforms with Spark can also be an
+// ingestr load target. The OneLake URI is name-based, so `workspace_name`
+// must be configured (the lakehouse name is always known); ingestr's OneLake
+// destination authenticates with the same service principal. Returns empty —
+// meaning "no ingestr support" — when workspace_name or the service
+// principal fields are missing (a static access_token cannot be forwarded).
 func (c *Config) GetIngestrURI() string {
-	return ""
+	if c.WorkspaceName == "" || c.TenantID == "" || c.ClientID == "" || c.ClientSecret == "" {
+		return ""
+	}
+
+	params := url.Values{}
+	params.Set("tenant_id", c.TenantID)
+	params.Set("client_id", c.ClientID)
+	params.Set("client_secret", c.ClientSecret)
+
+	return fmt.Sprintf("onelake://%s/%s?%s", url.PathEscape(c.WorkspaceName), url.PathEscape(c.LakehouseName), params.Encode())
 }

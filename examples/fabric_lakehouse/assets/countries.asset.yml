@@ -1,0 +1,17 @@
+name: raw.countries
+type: fabric.spark.seed
+
+parameters:
+  path: countries.csv
+
+columns:
+  - name: code
+    type: string
+    primary_key: true
+    checks:
+      - name: not_null
+      - name: unique
+  - name: name
+    type: string
+  - name: population
+    type: bigint

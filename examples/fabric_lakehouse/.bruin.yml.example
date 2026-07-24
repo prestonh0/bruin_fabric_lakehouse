@@ -23,6 +23,15 @@ environments:
           #     --scope "https://analysis.windows.net/powerbi/api/.default"
           # access_token: "eyJ..."
 
+          # Optional: workspace display name — enables ingestr integration
+          # (the lakehouse becomes an ingestr OneLake destination).
+          # workspace_name: "Analytics"
+
+          # Optional: run parallel assets concurrently in one Spark app.
+          # high_concurrency: true
+          # max_concurrent_repls: 4
+          # session_tag: my-shared-tag   # share a warm app across runs
+
           # Optional session tuning:
           # session_name: bruin-fabric-spark
           # environment_id: "fabric-environment-guid"

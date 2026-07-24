@@ -29,10 +29,25 @@ Fabric Spark session ──► Delta tables in the lakehouse
 
 - **`fabric.spark.sql` assets** — Spark SQL with bruin materializations:
   `view`, `create+replace` (with `partition_by` / `cluster_by`), `append`,
-  `merge`, `delete+insert`, `truncate+insert`, `time_interval`, and `ddl`.
+  `merge`, `delete+insert`, `truncate+insert`, `time_interval`, `anti_join`,
+  `ddl`, and full SCD2 (`scd2_by_column` / `scd2_by_time`, incremental and
+  full-refresh).
 - **`fabric.spark.pyspark` assets** — the asset's Python file runs as a
   PySpark statement in the *same* Spark session, with `spark` and `sc`
   predefined and the lakehouse as the default catalog.
+- **`fabric.spark.seed` assets** — load a CSV into a Delta table natively
+  through the Spark session (no ingestr required), with types taken from the
+  asset's column definitions.
+- **Sensors** — `fabric.spark.sensor.query` (poke a SQL condition) and
+  `fabric.spark.sensor.table` (wait for a table to exist, via
+  `SHOW TABLES` probing).
+- **High-concurrency mode** — opt-in `high_concurrency: true` switches the
+  connection to Fabric's `/highConcurrencySessions` API: a pool of REPLs
+  packed onto one Spark application, so parallel assets execute concurrently
+  instead of queueing on a single interpreter.
+- **ingestr integration** — with `workspace_name` configured, the connection
+  doubles as an ingestr **OneLake destination**, so ingestr assets can load
+  external data into the same lakehouse this connector transforms.
 - **Column quality checks** — `not_null`, `unique`, `positive`,
   `non_negative`, `negative`, `min`, `max`, `accepted_values`, `pattern`
   (via Spark `RLIKE`).
@@ -50,6 +65,7 @@ Fabric Spark session ──► Delta tables in the lakehouse
 |------|---------|
 | `fabricspark/` | The connector package, structured like a bruin `pkg/<platform>` package |
 | `examples/fabric_lakehouse/` | A runnable example pipeline (SQL + PySpark assets, connection template) |
+| `docs/DESIGN.md` | Architecture, diagrams, design decisions and trade-offs |
 | `docs/INTEGRATION.md` | Exact wiring instructions to land this in bruin upstream |
 
 The module compiles and tests standalone against
@@ -86,6 +102,7 @@ environments:
 | Field | Required | Notes |
 |-------|----------|-------|
 | `workspace_id` | yes | Fabric workspace GUID |
+| `workspace_name` | no | Workspace display name; required only for ingestr integration (the OneLake URI is name-based) |
 | `lakehouse_id` | yes | Lakehouse item GUID |
 | `lakehouse_name` | yes | Doubles as the database name for non-schema lakehouses |
 | `schema` | no | Default schema for schema-enabled lakehouses (e.g. `dbo`) |
@@ -95,6 +112,9 @@ environments:
 | `session_name` | no | Session name in the Fabric monitoring UI (default `bruin-fabric-spark`) |
 | `environment_id` | no | Pin the session to a Fabric Environment (custom pool/libraries) |
 | `spark_config` | no | Extra spark conf, e.g. `spark.sql.caseSensitive: "true"` |
+| `high_concurrency` | no | Use `/highConcurrencySessions`: parallel assets run concurrently in one Spark app (default false) |
+| `session_tag` | no | REPL packing key for high-concurrency mode; set explicitly to share a warm Spark app across bruin invocations (default: random per process) |
+| `max_concurrent_repls` | no | REPL pool cap in high-concurrency mode (default 4) |
 | `http_timeout_seconds` | no | Per-request timeout (default 120) |
 | `session_start_timeout_seconds` | no | Session cold-start budget (default 600) |
 | `statement_timeout_seconds` | no | Per-statement budget (default 43200; 0 = unlimited) |
@@ -163,10 +183,81 @@ pipeline.
 | `delete+insert` | ✅ | Temp view + `DELETE` + `INSERT` |
 | `truncate+insert` | ✅ | `DELETE FROM` + `INSERT` (works on every Delta table) |
 | `time_interval` | ✅ | Windowed `DELETE` + `INSERT` with `{{start_date}}`/`{{end_date}}` |
+| `anti_join` | ✅ | Connector-specific: insert-only incremental via null-safe `LEFT ANTI JOIN` on the compound business key (`primary_key` columns); optionally window-bounded |
 | `ddl` | ✅ | `CREATE TABLE IF NOT EXISTS` (no `PRIMARY KEY` constraint — Spark SQL doesn't have one) |
-| `scd2_by_column` / `scd2_by_time` | ⚠️ | Full-refresh rebuild only (`--full-refresh`); incremental SCD2 not implemented yet |
+| `scd2_by_column` / `scd2_by_time` | ✅ | Incremental `MERGE` that closes changed/vanished rows and inserts new versions, plus full-refresh rebuild. The merge uses `WHEN NOT MATCHED BY SOURCE`, which requires **Fabric runtime 1.3+** (Delta 3.x) |
+
+## Incremental patterns
+
+Two incremental styles are supported, and they can be combined:
+
+**1. Datetime-window incrementals (`time_interval`)** — classic
+window-replace: delete the run's window from the target, insert the fresh
+rows. Bruin renders `{{start_date}}`/`{{end_date}}` (or the `_timestamp`
+variants) from the run's `--start-date`/`--end-date`:
+
+```yaml
+materialization:
+  type: table
+  strategy: time_interval
+  incremental_key: event_date
+  time_granularity: date
+```
+
+**2. Business-key incrementals (`anti_join`)** — insert-only: append the
+rows from the query whose **compound business key** does not already exist
+in the target. The key is whatever columns are marked `primary_key`, joined
+null-safely (`<=>`), so multi-column keys and NULL-bearing keys both dedupe
+correctly. Unlike `merge`, existing rows are never touched — a pure,
+idempotent, re-runnable append:
+
+```yaml
+materialization:
+  type: table
+  strategy: anti_join
+columns:
+  - name: source_system
+    primary_key: true
+  - name: order_number
+    primary_key: true
+```
+
+renders (statements per run):
+
+```sql
+CREATE OR REPLACE TEMPORARY VIEW __bruin_tmp_x AS <your query>;
+INSERT INTO reporting.orders
+SELECT src.* FROM __bruin_tmp_x src
+LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders) tgt
+  ON src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number;
+DROP VIEW IF EXISTS __bruin_tmp_x;
+```
+
+**Combined** — on large targets, a full-table anti join gets expensive. Add
+`incremental_key` + `time_granularity` to bound the *target side* of the
+anti join to the run's datetime window:
+
+```yaml
+materialization:
+  type: table
+  strategy: anti_join
+  incremental_key: order_ts
+  time_granularity: timestamp
+```
+
+The target scan becomes `WHERE order_ts BETWEEN '{{start_timestamp}}' AND
+'{{end_timestamp}}'`, so the join only shuffles the window's keys. Trade-off:
+deduplication is only guaranteed against rows whose `incremental_key` falls
+inside the window — use the unbounded form when late-arriving duplicates
+across windows are possible. `--full-refresh` rebuilds the table via
+`create+replace` as usual. See
+[`examples/fabric_lakehouse/assets/orders_landing.sql`](examples/fabric_lakehouse/assets/orders_landing.sql).
 
 ## Design notes (vs. dbt-fabricspark)
+
+> For the full architecture — layer diagram, request sequence, session state
+> machine, and the reasoning behind each design decision — see
+> [`docs/DESIGN.md`](docs/DESIGN.md).
 
 This connector deliberately borrows the battle-tested parts of Microsoft's
 dbt adapter:
@@ -183,20 +274,55 @@ dbt adapter:
   throttling, and expired-session 404s are all retried/recovered the same
   way dbt handles them.
 
-Where it differs: bruin connectors are Go and synchronous per-connection, so
-instead of dbt's high-concurrency multi-REPL sessions this v1 runs one Livy
-session per connection with statements serialized — matching how bruin's
-other warehouse connections behave. PySpark support is a first-class asset
-type rather than dbt's Python-model compilation.
+Where it differs: the default mode runs one Livy session per connection with
+statements serialized — matching how bruin's other warehouse connections
+behave — with dbt-style multi-REPL high concurrency available as an opt-in
+(`high_concurrency: true`). PySpark support is a first-class asset type
+rather than dbt's Python-model compilation, and seeds load natively through
+Spark SQL instead of shelling out to ingestr.
+
+## Seeds, sensors and high concurrency
+
+**Seeds** load a CSV next to the asset file into a Delta table
+(`CREATE OR REPLACE` + batched `INSERT`s, types from the column definitions):
+
+```yaml
+name: raw.countries
+type: fabric.spark.seed
+parameters:
+  path: countries.csv
+columns:
+  - name: code
+    type: string
+```
+
+**Sensors** block a pipeline until an upstream condition holds:
+
+```yaml
+name: wait_for_events
+type: fabric.spark.sensor.table   # or fabric.spark.sensor.query
+parameters:
+  table: reporting.events          # query: SELECT COUNT(*) > 0 FROM ...
+```
+
+The table sensor probes with `SHOW TABLES IN <schema> LIKE '<table>'` rather
+than an `information_schema` lookup, which Fabric Spark lakehouses don't
+expose.
+
+**High concurrency**: by default one Livy session serves the connection and
+statements serialize. With `high_concurrency: true` the connector acquires up
+to `max_concurrent_repls` REPLs (via Fabric's `/highConcurrencySessions`
+API), all packed onto one Spark application by a shared `session_tag` —
+parallel assets then genuinely execute concurrently. REPLs that die are
+transparently replaced; a Spark-level statement failure keeps its REPL warm.
 
 ## Limitations / roadmap
 
-- Incremental SCD2 strategies are not implemented (full-refresh works).
-- No seed (`fabric.spark.seed`) or sensor asset types yet.
-- No ingestr integration (`GetIngestrURI` returns empty).
-- One session per connection; parallel assets queue on the session. A
-  high-concurrency session pool (Fabric `/highConcurrencySessions`) is the
-  natural next step.
+- Statement results arrive as a single JSON payload (no server-side cursor),
+  so very large `SELECT`s materialize fully in memory — fine for checks and
+  metadata, not for bulk extraction (use ingestr for that).
+- `Close()` isn't called automatically until the bruin connection manager
+  wires it up — idle sessions are reclaimed by Fabric's idle timeout instead.
 - The example pipeline only runs after the connector is wired into a bruin
   build — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
 
