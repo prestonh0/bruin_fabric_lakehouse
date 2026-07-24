@@ -353,9 +353,10 @@ flowchart TB
     subgraph AJ["<b>anti_join</b> — insert only, keyed"]
         direction TB
         AJ1["CREATE OR REPLACE TEMPORARY VIEW src AS …"]
+        AJ0["CREATE TABLE IF NOT EXISTS tgt<br/>AS SELECT * FROM src WHERE 1 = 0<br/><i>(first-run bootstrap)</i>"]
         AJ2["INSERT INTO tgt<br/>SELECT src.* FROM src<br/>LEFT ANTI JOIN (SELECT keys FROM tgt) tgt<br/>ON src.k1 &lt;=&gt; tgt.k1 AND src.k2 &lt;=&gt; tgt.k2"]
         AJ3["DROP VIEW IF EXISTS src"]
-        AJ1 --> AJ2 --> AJ3
+        AJ1 --> AJ0 --> AJ2 --> AJ3
     end
 
     subgraph TI["<b>time_interval</b> — window replace"]

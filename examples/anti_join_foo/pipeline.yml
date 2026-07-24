@@ -1,0 +1,4 @@
+name: anti-join-foo
+
+default_connections:
+  fabric_spark: fabric-spark-default

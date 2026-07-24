@@ -169,9 +169,9 @@ func TestBasicOperatorAntiJoinRendersRunWindow(t *testing.T) {
 
 	// A window-bounded anti join must go through placeholder re-rendering.
 	assert.Equal(t, 1, extractor.reextractCalls)
-	require.Len(t, client.queries, 3)
-	assert.Contains(t, client.queries[1], "LEFT ANTI JOIN")
-	assert.Contains(t, client.queries[1], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
+	require.Len(t, client.queries, 4)
+	assert.Contains(t, client.queries[2], "LEFT ANTI JOIN")
+	assert.Contains(t, client.queries[2], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
 }
 
 func TestPySparkOperatorRunTask(t *testing.T) {

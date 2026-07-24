@@ -1,0 +1,13 @@
+# Copy to .bruin.yml (or merge into yours) and fill in your lakehouse.
+default_environment: default
+environments:
+  default:
+    connections:
+      fabric_spark:
+        - name: fabric-spark-default
+          workspace_id: "11111111-2222-3333-4444-555555555555"
+          lakehouse_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+          lakehouse_name: my_lakehouse
+          tenant_id: "99999999-8888-7777-6666-555555555555"
+          client_id: "your-app-registration-client-id"
+          client_secret: "your-app-registration-secret"

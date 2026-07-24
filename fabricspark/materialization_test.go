@@ -325,18 +325,22 @@ func TestMaterializerRenderAntiJoinCompoundKey(t *testing.T) {
 
 	got, err := NewMaterializer(false).Render(asset, "SELECT * FROM staging.orders")
 	require.NoError(t, err)
-	require.Len(t, got, 3)
+	require.Len(t, got, 4)
 
 	assert.True(t, strings.HasPrefix(got[0], "CREATE OR REPLACE TEMPORARY VIEW __bruin_tmp_"))
 	assert.Contains(t, got[0], "SELECT * FROM staging.orders")
 
+	// First run bootstraps the target from the query's schema.
+	assert.Contains(t, got[1], "CREATE TABLE IF NOT EXISTS reporting.orders AS SELECT * FROM __bruin_tmp_")
+	assert.Contains(t, got[1], "WHERE 1 = 0")
+
 	// The insert must anti-join on BOTH business-key columns, null-safe, and
 	// only project the key columns from the target.
-	assert.Contains(t, got[1], "INSERT INTO reporting.orders")
-	assert.Contains(t, got[1], "LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders) tgt")
-	assert.Contains(t, got[1], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
+	assert.Contains(t, got[2], "INSERT INTO reporting.orders")
+	assert.Contains(t, got[2], "LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders) tgt")
+	assert.Contains(t, got[2], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
 
-	assert.True(t, strings.HasPrefix(got[2], "DROP VIEW IF EXISTS __bruin_tmp_"))
+	assert.True(t, strings.HasPrefix(got[3], "DROP VIEW IF EXISTS __bruin_tmp_"))
 }
 
 func TestMaterializerRenderAntiJoinWindowBounded(t *testing.T) {
@@ -358,11 +362,11 @@ func TestMaterializerRenderAntiJoinWindowBounded(t *testing.T) {
 
 	got, err := NewMaterializer(false).Render(asset, "SELECT * FROM staging.orders")
 	require.NoError(t, err)
-	require.Len(t, got, 3)
+	require.Len(t, got, 4)
 
 	// The target scan is bounded to the run window with the same
 	// placeholders time_interval uses.
-	assert.Contains(t, got[1],
+	assert.Contains(t, got[2],
 		"LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders WHERE order_ts BETWEEN '{{start_timestamp}}' AND '{{end_timestamp}}') tgt")
 }
 

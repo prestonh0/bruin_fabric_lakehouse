@@ -201,6 +201,9 @@ func buildAntiJoinQuery(task *pipeline.Asset, query string) ([]string, error) {
 
 	return []string{
 		fmt.Sprintf("CREATE OR REPLACE TEMPORARY VIEW %s AS %s", tempViewName, query),
+		// Bootstrap the target from the query's own schema so the very first
+		// run works without a manual --full-refresh.
+		fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s AS SELECT * FROM %s WHERE 1 = 0", task.Name, tempViewName),
 		fmt.Sprintf("INSERT INTO %s\nSELECT src.* FROM %s src\nLEFT ANTI JOIN %s tgt ON %s", task.Name, tempViewName, targetSide, strings.Join(on, " AND ")),
 		"DROP VIEW IF EXISTS " + tempViewName,
 	}, nil

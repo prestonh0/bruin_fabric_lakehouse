@@ -226,12 +226,17 @@ renders (statements per run):
 
 ```sql
 CREATE OR REPLACE TEMPORARY VIEW __bruin_tmp_x AS <your query>;
+-- first run only: bootstrap the target from the query's schema
+CREATE TABLE IF NOT EXISTS reporting.orders AS SELECT * FROM __bruin_tmp_x WHERE 1 = 0;
 INSERT INTO reporting.orders
 SELECT src.* FROM __bruin_tmp_x src
 LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders) tgt
   ON src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number;
 DROP VIEW IF EXISTS __bruin_tmp_x;
 ```
+
+A single-asset runnable demo of this pattern lives in
+[`examples/anti_join_foo/`](examples/anti_join_foo/).
 
 **Combined** — on large targets, a full-table anti join gets expensive. Add
 `incremental_key` + `time_granularity` to bound the *target side* of the
