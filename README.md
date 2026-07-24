@@ -50,6 +50,7 @@ Fabric Spark session ──► Delta tables in the lakehouse
 |------|---------|
 | `fabricspark/` | The connector package, structured like a bruin `pkg/<platform>` package |
 | `examples/fabric_lakehouse/` | A runnable example pipeline (SQL + PySpark assets, connection template) |
+| `docs/DESIGN.md` | Architecture, diagrams, design decisions and trade-offs |
 | `docs/INTEGRATION.md` | Exact wiring instructions to land this in bruin upstream |
 
 The module compiles and tests standalone against
@@ -234,6 +235,10 @@ across windows are possible. `--full-refresh` rebuilds the table via
 [`examples/fabric_lakehouse/assets/orders_landing.sql`](examples/fabric_lakehouse/assets/orders_landing.sql).
 
 ## Design notes (vs. dbt-fabricspark)
+
+> For the full architecture — layer diagram, request sequence, session state
+> machine, and the reasoning behind each design decision — see
+> [`docs/DESIGN.md`](docs/DESIGN.md).
 
 This connector deliberately borrows the battle-tested parts of Microsoft's
 dbt adapter:
