@@ -1,0 +1,32 @@
+# Copy the `fabric_spark` block into your own .bruin.yml environments.
+# The connection type / section name shown here matches the INTEGRATION.md
+# wiring; the fields map 1:1 onto fabricspark.Config.
+default_environment: default
+environments:
+  default:
+    connections:
+      fabric_spark:
+        - name: fabric-spark-default
+          workspace_id: "11111111-2222-3333-4444-555555555555"
+          lakehouse_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+          lakehouse_name: my_lakehouse
+          # Optional: default schema for schema-enabled lakehouses.
+          # schema: dbo
+
+          # Service principal auth (recommended for CI):
+          tenant_id: "99999999-8888-7777-6666-555555555555"
+          client_id: "your-app-registration-client-id"
+          client_secret: "your-app-registration-secret"
+
+          # ... or a pre-acquired token (useful locally):
+          #   az account get-access-token \
+          #     --scope "https://analysis.windows.net/powerbi/api/.default"
+          # access_token: "eyJ..."
+
+          # Optional session tuning:
+          # session_name: bruin-fabric-spark
+          # environment_id: "fabric-environment-guid"
+          # spark_config:
+          #   spark.sql.caseSensitive: "true"
+          # session_start_timeout_seconds: 600
+          # statement_timeout_seconds: 43200
