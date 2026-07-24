@@ -238,7 +238,7 @@ func TestMaterializerRender(t *testing.T) {
 			},
 		},
 		{
-			name: "incremental scd2 not supported",
+			name: "incremental scd2 requires primary key",
 			asset: &pipeline.Asset{
 				Name: "reporting.users",
 				Materialization: pipeline.Materialization{
@@ -247,7 +247,7 @@ func TestMaterializerRender(t *testing.T) {
 				},
 			},
 			query:   "SELECT 1",
-			wantErr: "--full-refresh",
+			wantErr: "primary_key",
 		},
 		{
 			name: "full refresh flips delete+insert to create+replace",

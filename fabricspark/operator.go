@@ -16,8 +16,11 @@ import (
 // Asset types provided by this connector. These are the values used in the
 // `type` field of bruin asset definitions.
 const (
-	AssetTypeFabricSparkQuery   = pipeline.AssetType("fabric.spark.sql")
-	AssetTypeFabricSparkPySpark = pipeline.AssetType("fabric.spark.pyspark")
+	AssetTypeFabricSparkQuery       = pipeline.AssetType("fabric.spark.sql")
+	AssetTypeFabricSparkPySpark     = pipeline.AssetType("fabric.spark.pyspark")
+	AssetTypeFabricSparkSeed        = pipeline.AssetType("fabric.spark.seed")
+	AssetTypeFabricSparkQuerySensor = pipeline.AssetType("fabric.spark.sensor.query")
+	AssetTypeFabricSparkTableSensor = pipeline.AssetType("fabric.spark.sensor.table")
 )
 
 type materializer interface {

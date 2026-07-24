@@ -21,8 +21,11 @@ convention.
 ## 2. Asset types — `pkg/pipeline/pipeline.go`
 
 ```go
-AssetTypeFabricSparkQuery   = AssetType("fabric.spark.sql")
-AssetTypeFabricSparkPySpark = AssetType("fabric.spark.pyspark")
+AssetTypeFabricSparkQuery       = AssetType("fabric.spark.sql")
+AssetTypeFabricSparkPySpark     = AssetType("fabric.spark.pyspark")
+AssetTypeFabricSparkSeed        = AssetType("fabric.spark.seed")
+AssetTypeFabricSparkQuerySensor = AssetType("fabric.spark.sensor.query")
+AssetTypeFabricSparkTableSensor = AssetType("fabric.spark.sensor.table")
 ```
 
 Add both to `AssetTypeConnectionMapping` with connection type
@@ -37,6 +40,7 @@ type FabricSparkConnection struct {
 	ConnectionMetadata `yaml:",inline" mapstructure:",squash"`
 
 	WorkspaceID   string `yaml:"workspace_id" json:"workspace_id" mapstructure:"workspace_id"`
+	WorkspaceName string `yaml:"workspace_name,omitempty" json:"workspace_name,omitempty" mapstructure:"workspace_name"`
 	LakehouseID   string `yaml:"lakehouse_id" json:"lakehouse_id" mapstructure:"lakehouse_id"`
 	LakehouseName string `yaml:"lakehouse_name" json:"lakehouse_name" mapstructure:"lakehouse_name"`
 	Schema        string `yaml:"schema,omitempty" json:"schema,omitempty" mapstructure:"schema"`
@@ -50,6 +54,10 @@ type FabricSparkConnection struct {
 	SessionName   string            `yaml:"session_name,omitempty" json:"session_name,omitempty" mapstructure:"session_name"`
 	EnvironmentID string            `yaml:"environment_id,omitempty" json:"environment_id,omitempty" mapstructure:"environment_id"`
 	SparkConfig   map[string]string `yaml:"spark_config,omitempty" json:"spark_config,omitempty" mapstructure:"spark_config"`
+
+	HighConcurrency    bool   `yaml:"high_concurrency,omitempty" json:"high_concurrency,omitempty" mapstructure:"high_concurrency"`
+	SessionTag         string `yaml:"session_tag,omitempty" json:"session_tag,omitempty" mapstructure:"session_tag"`
+	MaxConcurrentREPLs int    `yaml:"max_concurrent_repls,omitempty" json:"max_concurrent_repls,omitempty" mapstructure:"max_concurrent_repls"`
 
 	HTTPTimeoutSeconds         int `yaml:"http_timeout_seconds,omitempty" json:"http_timeout_seconds,omitempty" mapstructure:"http_timeout_seconds"`
 	SessionStartTimeoutSeconds int `yaml:"session_start_timeout_seconds,omitempty" json:"session_start_timeout_seconds,omitempty" mapstructure:"session_start_timeout_seconds"`
@@ -131,6 +139,9 @@ pipeline.AssetTypeFabricSparkPySpark: {
 },
 ```
 
+…and identical blocks for `AssetTypeFabricSparkSeed`,
+`AssetTypeFabricSparkQuerySensor` and `AssetTypeFabricSparkTableSensor`.
+
 ## 6. Operator wiring — `cmd/run.go`
 
 Follow the Databricks block in `setupExecutors`:
@@ -144,6 +155,9 @@ if s.WillRunTaskOfType(pipeline.AssetTypeFabricSparkQuery) || estimateCustomChec
 	})
 	fabricSparkCheckRunner := fabricspark.NewColumnCheckOperator(conn)
 	fabricSparkPySparkOperator := fabricspark.NewPySparkOperator(conn)
+	fabricSparkSeedOperator := fabricspark.NewSeedOperator(conn)
+	fabricSparkQuerySensor := fabricspark.NewQuerySensor(conn, wholeFileExtractor, sensorMode)
+	fabricSparkTableSensor := fabricspark.NewTableSensor(conn, sensorMode)
 
 	mainExecutors[pipeline.AssetTypeFabricSparkQuery][scheduler.TaskInstanceTypeMain] = fabricSparkOperator
 	mainExecutors[pipeline.AssetTypeFabricSparkQuery][scheduler.TaskInstanceTypeColumnCheck] = fabricSparkCheckRunner
@@ -151,8 +165,24 @@ if s.WillRunTaskOfType(pipeline.AssetTypeFabricSparkQuery) || estimateCustomChec
 	mainExecutors[pipeline.AssetTypeFabricSparkPySpark][scheduler.TaskInstanceTypeMain] = fabricSparkPySparkOperator
 	mainExecutors[pipeline.AssetTypeFabricSparkPySpark][scheduler.TaskInstanceTypeColumnCheck] = fabricSparkCheckRunner
 	mainExecutors[pipeline.AssetTypeFabricSparkPySpark][scheduler.TaskInstanceTypeCustomCheck] = customCheckRunner
+	mainExecutors[pipeline.AssetTypeFabricSparkSeed][scheduler.TaskInstanceTypeMain] = fabricSparkSeedOperator
+	mainExecutors[pipeline.AssetTypeFabricSparkSeed][scheduler.TaskInstanceTypeColumnCheck] = fabricSparkCheckRunner
+	mainExecutors[pipeline.AssetTypeFabricSparkSeed][scheduler.TaskInstanceTypeCustomCheck] = customCheckRunner
+	mainExecutors[pipeline.AssetTypeFabricSparkQuerySensor][scheduler.TaskInstanceTypeMain] = fabricSparkQuerySensor
+	mainExecutors[pipeline.AssetTypeFabricSparkTableSensor][scheduler.TaskInstanceTypeMain] = fabricSparkTableSensor
 }
 ```
+
+Note the table sensor is `fabricspark.NewTableSensor`, not the ansisql one:
+Fabric Spark has no information_schema, so the connector probes with
+`SHOW TABLES` and counts rows client-side.
+
+Seed assets (`fabric.spark.seed`) do NOT use bruin's shared ingestr-based
+seed operator — `fabricspark.NewSeedOperator` loads the CSV natively through
+the Spark session. The ingestr URI the connection exposes (see
+`Config.GetIngestrURI`) is for regular `ingestr` assets targeting the
+lakehouse as an ingestr OneLake destination; it requires `workspace_name` and
+service-principal auth.
 
 Note: `pipeline.HookWrapperMaterializerList` expects the list-returning
 `Render(asset, query) ([]string, error)` interface, which

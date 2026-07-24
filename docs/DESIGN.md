@@ -201,12 +201,13 @@ Three consequences follow from "one session per connection":
    visible to a PySpark asset in the same run, and vice versa. This is the
    main reason PySpark is a first-class asset type rather than a separate
    submission mechanism.
-2. **Statements serialize.** `db.mu` is held for the whole submit-and-poll
-   cycle, so parallel assets on one connection queue rather than running
-   concurrently in Spark. This matches how bruin's other warehouse
-   connections behave, and it avoids the complexity of dbt-fabricspark's
-   multi-REPL high-concurrency mode. It is also the clearest scaling limit —
-   see §7.
+2. **Statements serialize — unless high-concurrency mode is on.** In the
+   default mode `db.mu` is held for the whole submit-and-poll cycle, so
+   parallel assets on one connection queue rather than running concurrently
+   in Spark, matching how bruin's other warehouse connections behave. With
+   `high_concurrency: true` the connection instead pools REPLs from Fabric's
+   `/highConcurrencySessions` API and parallel assets execute concurrently
+   inside one shared Spark application — see §7.
 3. **Cold start is paid once per run**, not per asset — which is why lazy
    creation matters: constructing a `DB` performs no I/O at all, so
    configuring a Fabric connection you never use costs nothing.
@@ -336,9 +337,12 @@ no context, no client. Spark-specific choices worth noting:
 - **`partition_by` and `cluster_by` are mutually exclusive** — Hive-style
   partitioning and Delta liquid clustering cannot both apply. Rejected at
   render time with a clear message rather than failing in Spark.
-- **Incremental SCD2 is explicitly unimplemented**, with an error that names
-  the workaround (`--full-refresh` or `merge`). A wrong SCD2 implementation
-  silently corrupts history, so refusing is the safer default.
+- **SCD2 runs as a single MERGE** (ported from bruin's Databricks connector,
+  whose SQL dialect matches Spark's): changed and vanished current rows get
+  closed (`_valid_until`, `_is_current = FALSE`) and new versions inserted in
+  one statement. The `WHEN NOT MATCHED BY SOURCE` clause it relies on needs
+  Fabric runtime 1.3+ (Delta 3.x). `--full-refresh` rebuilds the table with
+  the bookkeeping columns intact rather than as a plain table.
 
 #### The two incremental strategies
 
@@ -423,7 +427,7 @@ and override the two that are not: `accepted_values` (needs
 | Decision | Rationale | Trade-off accepted |
 |---|---|---|
 | Livy REST rather than JDBC/ODBC | No driver, no Spark client runtime; the only interface Fabric Lakehouse exposes for external Spark submission | Polling latency; results fully materialized in memory |
-| One session per connection | Shared catalog/temp-view state between SQL and PySpark; cold start paid once | Statements serialize; no intra-connection parallelism |
+| One session per connection (default) | Shared catalog/temp-view state between SQL and PySpark; cold start paid once | Statements serialize; opt into `high_concurrency` for parallel REPLs |
 | Lazy session creation | Configuring an unused connection costs nothing; `NewDB` never does I/O | First statement of a run absorbs the cold start |
 | Materializers as pure functions | Every SQL rule unit-testable without a server | None material |
 | Standalone Go module | Builds and tests against real bruin interfaces today, without forking bruin | Must be copied into `pkg/` for upstream; bruin version pinned |
@@ -478,21 +482,35 @@ aspirational. The whole suite runs in ~2s with no Fabric access.
 
 ## 7. Limitations and roadmap
 
-Ordered by how much they are likely to matter:
+The original v1 roadmap items are now implemented:
 
-1. **No intra-connection parallelism.** One session, statements serialized.
-   The fix is Fabric's `/highConcurrencySessions` endpoint (what
-   dbt-fabricspark uses): one Spark application, N REPLs, statements
-   executing in parallel. This is the highest-value next step for wide DAGs.
-2. **Incremental SCD2 unimplemented.** Full-refresh rebuild works.
-3. **No seed or sensor asset types** (`fabric.spark.seed`,
-   `fabric.spark.sensor.*`).
-4. **No ingestr integration** — `GetIngestrURI()` returns empty, so this
-   connector cannot be an ingestr source or destination.
-5. **Results fully materialized.** The Livy API has no cursor; a
+- **Intra-connection parallelism** — opt-in `high_concurrency: true` uses
+  Fabric's `/highConcurrencySessions` API. The connection maintains a pool of
+  up to `max_concurrent_repls` REPLs, all packed onto one Spark application
+  by a shared `session_tag`; parallel assets check out REPLs and execute
+  concurrently. Dead REPLs are replaced transparently; Spark-level statement
+  failures keep their REPL warm (only transport failures discard it).
+- **Incremental SCD2** — `scd2_by_column` and `scd2_by_time` run as a single
+  `MERGE` that closes changed/vanished current rows and inserts new versions.
+  Requires Fabric runtime 1.3+ (Delta 3.x) for `WHEN NOT MATCHED BY SOURCE`.
+  `--full-refresh` rebuilds the table with its bookkeeping columns.
+- **Seeds** — `fabric.spark.seed` loads CSVs natively via the Spark session
+  (`CREATE OR REPLACE` + batched typed `INSERT`s), avoiding the ingestr
+  dependency bruin's shared seed operator carries.
+- **Sensors** — `fabric.spark.sensor.query` reuses bruin's generic ANSI
+  query sensor; `fabric.spark.sensor.table` is Spark-specific, probing with
+  `SHOW TABLES` because lakehouses expose no information_schema.
+- **ingestr** — the connection maps onto ingestr's OneLake destination
+  (`onelake://workspace/lakehouse?…` with the same service principal) when
+  `workspace_name` is configured, so ingestr loads and Spark transforms can
+  share one connection definition.
+
+What remains, ordered by how much it is likely to matter:
+
+1. **Results fully materialized.** The Livy API has no cursor; a
    `SELECT *` on a huge table will pull the whole result into memory. Fine for
-   checks and metadata, not for bulk extraction.
-6. **`Close()` is not called automatically.** Until the connection manager
+   checks and metadata, not for bulk extraction — use ingestr for that.
+2. **`Close()` is not called automatically.** Until the connection manager
    invokes it (see INTEGRATION.md §8), sessions linger until Fabric's idle
    timeout reclaims them.
 

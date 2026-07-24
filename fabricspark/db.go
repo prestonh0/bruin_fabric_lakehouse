@@ -2,10 +2,13 @@ package fabricspark
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bruin-data/bruin/pkg/ansisql"
 	"github.com/bruin-data/bruin/pkg/pipeline"
@@ -23,6 +26,12 @@ type DB struct {
 
 	mu      sync.Mutex
 	session *LivySession
+
+	// High-concurrency mode state: idle REPLs ready for checkout, plus a
+	// count of live acquires so the pool stays within MaxConcurrentREPLs.
+	hcSessionTag string
+	hcPool       chan *HCSession
+	hcLive       int
 }
 
 // NewDB builds a Fabric Spark client from the config. No network calls are
@@ -37,11 +46,38 @@ func NewDB(c *Config) (*DB, error) {
 		return nil, err
 	}
 
-	return &DB{
+	db := &DB{
 		config:        c,
 		client:        NewLivyClient(c, tokens),
 		schemaCreator: ansisql.NewSchemaCreator(),
-	}, nil
+	}
+
+	if c.HighConcurrency {
+		db.hcSessionTag = c.SessionTag
+		if db.hcSessionTag == "" {
+			db.hcSessionTag = randomSessionTag()
+		}
+		db.hcPool = make(chan *HCSession, db.maxREPLs())
+	}
+
+	return db, nil
+}
+
+func (db *DB) maxREPLs() int {
+	if db.config.MaxConcurrentREPLs > 0 {
+		return db.config.MaxConcurrentREPLs
+	}
+	return 4
+}
+
+func randomSessionTag() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		// Fall back to a fixed tag; sharing one Spark app is safe, just
+		// coarser packing than intended.
+		return "bruin-fabric-spark"
+	}
+	return "bruin-" + hex.EncodeToString(buf)
 }
 
 // QuoteIdentifier quotes a Spark identifier with backticks, part by part.
@@ -89,9 +125,17 @@ func (db *DB) ensureSession(ctx context.Context) (*LivySession, error) {
 	return session, nil
 }
 
-// runStatement executes code in the shared session, transparently recreating
-// the session once if Fabric reports it gone (expired idle timeout).
+// runStatement executes code in the connection's Spark session. In singleton
+// mode statements serialize on one session; in high-concurrency mode each
+// call checks out a REPL from the pool so parallel assets execute
+// concurrently inside the shared Spark application. In both modes a session
+// reported gone by Fabric (expired idle timeout) is transparently recreated
+// once.
 func (db *DB) runStatement(ctx context.Context, code, kind string) (*StatementOutput, error) {
+	if db.config.HighConcurrency {
+		return db.runStatementHC(ctx, code, kind)
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -115,6 +159,109 @@ func (db *DB) runStatement(ctx context.Context, code, kind string) (*StatementOu
 	}
 
 	return db.client.WaitForStatement(ctx, session.IDString(), statement.ID.String())
+}
+
+// hcAcquirePayload mirrors sessionPayload with the packing tag added.
+func (db *DB) hcAcquirePayload() map[string]any {
+	payload := db.sessionPayload()
+	payload["sessionTag"] = db.hcSessionTag
+	return payload
+}
+
+// checkoutREPL returns an idle REPL, acquiring a new one when the pool is
+// empty and below its cap, or waiting for a return otherwise.
+func (db *DB) checkoutREPL(ctx context.Context) (*HCSession, error) {
+	for {
+		select {
+		case repl := <-db.hcPool:
+			return repl, nil
+		default:
+		}
+
+		db.mu.Lock()
+		if db.hcLive < db.maxREPLs() {
+			db.hcLive++
+			db.mu.Unlock()
+
+			repl, err := db.client.AcquireHCSession(ctx, db.hcAcquirePayload())
+			if err != nil {
+				db.discardREPL(nil)
+				return nil, err
+			}
+			return repl, nil
+		}
+		db.mu.Unlock()
+
+		// Pool exhausted and at cap: wait for a REPL to come back. The wait
+		// is bounded so that when another goroutine's acquire fails (freeing
+		// a live slot without ever putting a REPL in the pool), waiters loop
+		// back and take the slot instead of blocking forever.
+		select {
+		case repl := <-db.hcPool:
+			return repl, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func (db *DB) returnREPL(repl *HCSession) {
+	db.hcPool <- repl
+}
+
+// discardREPL drops a dead (or failed-to-acquire) REPL from the live count so
+// a replacement can be acquired.
+func (db *DB) discardREPL(repl *HCSession) {
+	db.mu.Lock()
+	db.hcLive--
+	db.mu.Unlock()
+
+	if repl != nil {
+		// Best-effort release; the REPL is likely already gone server-side.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = db.client.ReleaseHCSession(ctx, repl.HCID)
+	}
+}
+
+func (db *DB) runStatementHC(ctx context.Context, code, kind string) (*StatementOutput, error) {
+	repl, err := db.checkoutREPL(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	statement, err := db.client.SubmitHCStatement(ctx, repl, code, kind)
+	var submitErr *StatementSubmitError
+	if errors.As(err, &submitErr) && submitErr.SessionGone() {
+		// This REPL (or its Spark app) is gone; replace it and retry once.
+		db.discardREPL(repl)
+		repl, err = db.checkoutREPL(ctx)
+		if err != nil {
+			return nil, err
+		}
+		statement, err = db.client.SubmitHCStatement(ctx, repl, code, kind)
+	}
+	if err != nil {
+		db.discardREPL(repl)
+		return nil, err
+	}
+
+	output, err := db.client.WaitForHCStatement(ctx, repl, statement.ID.String())
+	if err != nil {
+		// A Spark-level failure leaves the REPL healthy — keep it warm.
+		// Transport-level failures (timeouts, lost statements) discard it.
+		var failed *StatementFailedError
+		if errors.As(err, &failed) {
+			db.returnREPL(repl)
+		} else {
+			db.discardREPL(repl)
+		}
+		return nil, err
+	}
+
+	db.returnREPL(repl)
+	return output, nil
 }
 
 // runSQL executes a single SQL statement and parses its tabular output.
@@ -197,9 +344,28 @@ func (db *DB) RunPySpark(ctx context.Context, code string) (string, error) {
 	return ParseTextOutput(output), nil
 }
 
-// Close tears down the Livy session, releasing Spark capacity. Safe to call
-// when no session was ever created.
+// Close tears down the Livy session (or releases all pooled REPLs in
+// high-concurrency mode), releasing Spark capacity. Safe to call when no
+// session was ever created.
 func (db *DB) Close(ctx context.Context) error {
+	var firstErr error
+
+	if db.hcPool != nil {
+		for {
+			select {
+			case repl := <-db.hcPool:
+				if err := db.client.ReleaseHCSession(ctx, repl.HCID); err != nil && firstErr == nil {
+					firstErr = err
+				}
+				db.mu.Lock()
+				db.hcLive--
+				db.mu.Unlock()
+			default:
+				return firstErr
+			}
+		}
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -209,6 +375,12 @@ func (db *DB) Close(ctx context.Context) error {
 	err := db.client.CloseSession(ctx, db.session.IDString())
 	db.session = nil
 	return err
+}
+
+// GetIngestrURI exposes the connection as an ingestr OneLake destination; see
+// Config.GetIngestrURI for the mapping and its requirements.
+func (db *DB) GetIngestrURI() (string, error) {
+	return db.config.GetIngestrURI(), nil
 }
 
 type annotatedSchemaQueryRunner struct {
