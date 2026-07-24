@@ -1,0 +1,5429 @@
+From 9abe659051090b1d58eba84603172d20d6ff3b2c Mon Sep 17 00:00:00 2001
+From: Preston Hervey <preston.hervey@gmail.com>
+Date: Fri, 24 Jul 2026 21:56:13 +0000
+Subject: [PATCH] feat: add Microsoft Fabric Lakehouse (Spark) platform
+
+Adds a new platform, fabric_spark, that runs bruin assets against
+Microsoft Fabric Lakehouses using Spark SQL as the compute engine with
+first-class PySpark support, driven through the Fabric Lakehouse Livy
+API (the same interface as Microsoft's dbt-fabricspark adapter). The
+existing fabric platform targets Fabric Warehouse over the SQL/TDS
+endpoint; this fills the Lakehouse/Spark gap.
+
+New package pkg/fabricspark:
+- Livy REST client: session lifecycle, sql/pyspark statements, Azure AD
+  service principal (client credentials, cached tokens) or static token
+  auth, retries with backoff, 429 Retry-After handling, transient-404
+  tolerance, transparent expired-session recovery
+- DB client implementing the standard connection interfaces (Select,
+  SelectWithSchema, RunQueryWithoutResult, Ping, CreateSchemaIfNotExist,
+  GetDatabases/GetTables/GetColumns) plus RunPySpark
+- Delta materializations: view, create+replace (partitioning / liquid
+  clustering), append, merge, delete+insert, truncate+insert,
+  time_interval, ddl, incremental SCD2 (scd2_by_column / scd2_by_time,
+  requires Fabric runtime 1.3+ for WHEN NOT MATCHED BY SOURCE), and a
+  new anti_join strategy: insert-only incremental via null-safe LEFT
+  ANTI JOIN on the asset's primary_key columns, self-bootstrapping and
+  optionally bounded to the run window
+- Asset types: fabric.spark.sql, fabric.spark.pyspark (runs in the same
+  Spark session as SQL assets), fabric.spark.seed (native CSV loader),
+  fabric.spark.sensor.query, fabric.spark.sensor.table (SHOW TABLES
+  prober; lakehouses expose no information_schema)
+- Optional high-concurrency mode: pools REPLs from Fabric's
+  /highConcurrencySessions API so parallel assets execute concurrently
+  inside one Spark application
+- ingestr integration via the OneLake destination URI
+- Column checks incl. Spark-specific accepted_values and RLIKE pattern
+
+Registration: pipeline asset types + anti_join strategy, config
+connection type fabric_spark, connection manager, executor defaults,
+run/render wiring, lint (table sensor allowlist, platform name,
+anti_join validation), jinja platform overrides (Spark dialect),
+sqlglot dialect mapping, and a docs page.
+
+Tests: 50 test functions (100 cases) including an in-process mock of
+the Fabric Livy API covering session lifecycle, statement submit/poll,
+high-concurrency REPL pooling/recovery, throttling and session expiry;
+suite is race-clean and needs no Fabric capacity. Verified end-to-end
+with the built CLI: bruin validate and bruin render against a
+fabric.spark.sql pipeline.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01E2ARjCzEAcAdwrDJtjNiGw
+---
+ cmd/render.go                           |   3 +
+ cmd/render_ddl.go                       |   3 +
+ cmd/run.go                              |  36 ++
+ docs/.vitepress/config.mjs              |   1 +
+ docs/platforms/fabric-spark.md          | 142 +++++
+ pkg/config/connections.go               |  35 ++
+ pkg/config/manager.go                   |  11 +
+ pkg/connection/connection.go            |  45 ++
+ pkg/executor/defaults.go                |  30 ++
+ pkg/fabricspark/bruin_funcs.go          |  21 +
+ pkg/fabricspark/checks.go               |  77 +++
+ pkg/fabricspark/config.go               | 174 +++++++
+ pkg/fabricspark/config_test.go          | 129 +++++
+ pkg/fabricspark/db.go                   | 547 ++++++++++++++++++++
+ pkg/fabricspark/db_test.go              | 578 +++++++++++++++++++++
+ pkg/fabricspark/livy.go                 | 661 ++++++++++++++++++++++++
+ pkg/fabricspark/materialization.go      | 528 +++++++++++++++++++
+ pkg/fabricspark/materialization_test.go | 386 ++++++++++++++
+ pkg/fabricspark/materializer.go         |  91 ++++
+ pkg/fabricspark/operator.go             | 208 ++++++++
+ pkg/fabricspark/operator_test.go        | 199 +++++++
+ pkg/fabricspark/scd2_test.go            | 129 +++++
+ pkg/fabricspark/seed.go                 | 192 +++++++
+ pkg/fabricspark/seed_test.go            | 110 ++++
+ pkg/fabricspark/sensor.go               | 150 ++++++
+ pkg/fabricspark/sensor_test.go          |  99 ++++
+ pkg/fabricspark/token.go                | 137 +++++
+ pkg/fabricspark/token_test.go           | 103 ++++
+ pkg/jinja/bruin_funcs.go                |  20 +-
+ pkg/jinja/jinja.go                      |  14 +-
+ pkg/lint/rules.go                       |  64 ++-
+ pkg/pipeline/pipeline.go                |  21 +
+ pkg/sqlparser/parser.go                 |   2 +
+ 33 files changed, 4908 insertions(+), 38 deletions(-)
+
+diff --git a/cmd/render.go b/cmd/render.go
+index 20c0129..394a96c 100644
+--- a/cmd/render.go
++++ b/cmd/render.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/bruin-data/bruin/pkg/dremio"
+ 	duck "github.com/bruin-data/bruin/pkg/duckdb"
+ 	"github.com/bruin-data/bruin/pkg/fabric"
++	"github.com/bruin-data/bruin/pkg/fabricspark"
+ 	"github.com/bruin-data/bruin/pkg/git"
+ 	"github.com/bruin-data/bruin/pkg/jinja"
+ 	"github.com/bruin-data/bruin/pkg/mssql"
+@@ -303,6 +304,8 @@ func Render() *cli.Command {
+ 					pipeline.AssetTypeMsSQLQuerySensor:        mssql.NewMaterializer(fullRefresh),
+ 					pipeline.AssetTypeDatabricksQuery:         databricks.NewRenderer(fullRefresh),
+ 					pipeline.AssetTypeDatabricksQuerySensor:   databricks.NewRenderer(fullRefresh),
++					pipeline.AssetTypeFabricSparkQuery:        fabricspark.NewRenderer(fullRefresh),
++					pipeline.AssetTypeFabricSparkQuerySensor:  fabricspark.NewRenderer(fullRefresh),
+ 					pipeline.AssetTypeSynapseQuery:            synapse.NewRenderer(fullRefresh),
+ 					pipeline.AssetTypeSynapseQuerySensor:      synapse.NewRenderer(fullRefresh),
+ 					pipeline.AssetTypeVerticaQuery:            vertica.NewMaterializer(fullRefresh),
+diff --git a/cmd/render_ddl.go b/cmd/render_ddl.go
+index 4839744..36fdd20 100644
+--- a/cmd/render_ddl.go
++++ b/cmd/render_ddl.go
+@@ -17,6 +17,7 @@ import (
+ 	"github.com/bruin-data/bruin/pkg/dremio"
+ 	duck "github.com/bruin-data/bruin/pkg/duckdb"
+ 	"github.com/bruin-data/bruin/pkg/fabric"
++	"github.com/bruin-data/bruin/pkg/fabricspark"
+ 	"github.com/bruin-data/bruin/pkg/git"
+ 	"github.com/bruin-data/bruin/pkg/jinja"
+ 	"github.com/bruin-data/bruin/pkg/mssql"
+@@ -243,6 +244,8 @@ func RenderDDL() *cli.Command {
+ 					pipeline.AssetTypeMsSQLQuerySensor:        mssql.NewMaterializer(false),
+ 					pipeline.AssetTypeDatabricksQuery:         databricks.NewRenderer(false),
+ 					pipeline.AssetTypeDatabricksQuerySensor:   databricks.NewRenderer(false),
++					pipeline.AssetTypeFabricSparkQuery:        fabricspark.NewRenderer(false),
++					pipeline.AssetTypeFabricSparkQuerySensor:  fabricspark.NewRenderer(false),
+ 					pipeline.AssetTypeSynapseQuery:            synapse.NewRenderer(false),
+ 					pipeline.AssetTypeSynapseQuerySensor:      synapse.NewRenderer(false),
+ 					pipeline.AssetTypeVerticaQuery:            vertica.NewMaterializer(false),
+diff --git a/cmd/run.go b/cmd/run.go
+index 7895fb7..a1e1b5a 100644
+--- a/cmd/run.go
++++ b/cmd/run.go
+@@ -34,6 +34,7 @@ import (
+ 	"github.com/bruin-data/bruin/pkg/emr_serverless"
+ 	"github.com/bruin-data/bruin/pkg/executor"
+ 	fabric "github.com/bruin-data/bruin/pkg/fabric"
++	"github.com/bruin-data/bruin/pkg/fabricspark"
+ 	"github.com/bruin-data/bruin/pkg/git"
+ 	"github.com/bruin-data/bruin/pkg/ingestr"
+ 	"github.com/bruin-data/bruin/pkg/jinja"
+@@ -2387,6 +2388,41 @@ func SetupExecutors(
+ 		}, estimateCustomCheckType == pipeline.AssetTypeDatabricksQuery)
+ 	}
+ 
++	if s.WillRunTaskOfType(pipeline.AssetTypeFabricSparkQuery) || estimateCustomCheckType == pipeline.AssetTypeFabricSparkQuery ||
++		s.WillRunTaskOfType(pipeline.AssetTypeFabricSparkPySpark) || s.WillRunTaskOfType(pipeline.AssetTypeFabricSparkSeed) ||
++		s.WillRunTaskOfType(pipeline.AssetTypeFabricSparkQuerySensor) || s.WillRunTaskOfType(pipeline.AssetTypeFabricSparkTableSensor) {
++		fabricSparkOperator := fabricspark.NewBasicOperator(conn, wholeFileExtractor, pipeline.HookWrapperMaterializerList{
++			Mat:     fabricspark.NewMaterializer(fullRefresh),
++			Hoister: hoister,
++		})
++		fabricSparkCheckRunner := fabricspark.NewColumnCheckOperator(conn)
++		fabricSparkPySparkOperator := fabricspark.NewPySparkOperator(conn)
++		// Seeds load natively through the Spark session rather than via the
++		// shared ingestr seed operator, which has no Lakehouse destination.
++		fabricSparkSeedOperator := fabricspark.NewSeedOperator(conn)
++		fabricSparkQuerySensor := fabricspark.NewQuerySensor(conn, wholeFileExtractor, sensorMode)
++		// The table sensor is Spark-specific: lakehouses expose no
++		// information_schema, so it probes with SHOW TABLES instead.
++		fabricSparkTableSensor := fabricspark.NewTableSensor(conn, sensorMode)
++
++		mainExecutors[pipeline.AssetTypeFabricSparkQuery][scheduler.TaskInstanceTypeMain] = fabricSparkOperator
++		mainExecutors[pipeline.AssetTypeFabricSparkQuery][scheduler.TaskInstanceTypeColumnCheck] = fabricSparkCheckRunner
++		mainExecutors[pipeline.AssetTypeFabricSparkQuery][scheduler.TaskInstanceTypeCustomCheck] = customCheckRunner
++		mainExecutors[pipeline.AssetTypeFabricSparkPySpark][scheduler.TaskInstanceTypeMain] = fabricSparkPySparkOperator
++		mainExecutors[pipeline.AssetTypeFabricSparkPySpark][scheduler.TaskInstanceTypeColumnCheck] = fabricSparkCheckRunner
++		mainExecutors[pipeline.AssetTypeFabricSparkPySpark][scheduler.TaskInstanceTypeCustomCheck] = customCheckRunner
++		mainExecutors[pipeline.AssetTypeFabricSparkSeed][scheduler.TaskInstanceTypeMain] = fabricSparkSeedOperator
++		mainExecutors[pipeline.AssetTypeFabricSparkSeed][scheduler.TaskInstanceTypeColumnCheck] = fabricSparkCheckRunner
++		mainExecutors[pipeline.AssetTypeFabricSparkSeed][scheduler.TaskInstanceTypeCustomCheck] = customCheckRunner
++		mainExecutors[pipeline.AssetTypeFabricSparkQuerySensor][scheduler.TaskInstanceTypeMain] = fabricSparkQuerySensor
++		mainExecutors[pipeline.AssetTypeFabricSparkTableSensor][scheduler.TaskInstanceTypeMain] = fabricSparkTableSensor
++
++		if estimateCustomCheckType == pipeline.AssetTypeFabricSparkQuery {
++			mainExecutors[pipeline.AssetTypePython][scheduler.TaskInstanceTypeColumnCheck] = fabricSparkCheckRunner
++			mainExecutors[pipeline.AssetTypePython][scheduler.TaskInstanceTypeCustomCheck] = customCheckRunner
++		}
++	}
++
+ 	if s.WillRunTaskOfType(pipeline.AssetTypeIngestr) || estimateCustomCheckType == pipeline.AssetTypeIngestr {
+ 		ingestrOperator, err := ingestr.NewBasicOperator(conn, renderer)
+ 		if err != nil {
+diff --git a/docs/.vitepress/config.mjs b/docs/.vitepress/config.mjs
+index b572f0d..fb9789e 100644
+--- a/docs/.vitepress/config.mjs
++++ b/docs/.vitepress/config.mjs
+@@ -253,6 +253,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+                             {text: "Google BigQuery", link: "/platforms/bigquery"},
+                             {text: "Microsoft SQL Server", link: "/platforms/mssql"},
+                             {text: "Microsoft Fabric", link: "/platforms/fabric"},
++                            {text: "Microsoft Fabric Lakehouse (Spark)", link: "/platforms/fabric-spark"},
+                             {text: "MySQL", link: "/platforms/mysql"},
+                             {text: "Postgres", link: "/platforms/postgres"},
+                             {text: "Redshift", link: "/platforms/redshift"},
+diff --git a/docs/platforms/fabric-spark.md b/docs/platforms/fabric-spark.md
+new file mode 100644
+index 0000000..c1c5ecc
+--- /dev/null
++++ b/docs/platforms/fabric-spark.md
+@@ -0,0 +1,142 @@
++# Microsoft Fabric Lakehouse (Spark)
++
++Bruin supports Microsoft Fabric **Lakehouses** with Spark SQL as the compute
++engine, including running PySpark when needed. Assets execute inside a Fabric
++Spark session through the lakehouse's [Livy API](https://learn.microsoft.com/en-us/fabric/data-engineering/api-livy-overview),
++materializing Delta tables natively.
++
++> [!NOTE]
++> This platform targets the Lakehouse Spark engine. For Fabric
++> **Warehouses** (T-SQL over the SQL endpoint), use the
++> [`fabric`](./fabric.md) platform instead.
++
++## Connection
++
++```yaml
++connections:
++  fabric_spark:
++    - name: "connection_name"
++      workspace_id: "fabric-workspace-guid"
++      lakehouse_id: "lakehouse-item-guid"
++      lakehouse_name: "my_lakehouse"
++
++      # Option A — service principal (recommended for CI):
++      tenant_id: "azure-tenant-guid"
++      client_id: "app-registration-client-id"
++      client_secret: "app-registration-secret"
++
++      # Option B — pre-acquired token (local development):
++      # access_token: "eyJ..."
++      # e.g. az account get-access-token --scope "https://analysis.windows.net/powerbi/api/.default"
++```
++
++The service principal needs Contributor (or higher) access to the workspace,
++and the tenant must allow service principals to use Fabric APIs.
++
++Optional fields:
++
++| Field | Description |
++|-------|-------------|
++| `schema` | Default schema for schema-enabled lakehouses (e.g. `dbo`) |
++| `workspace_name` | Workspace display name; enables ingestr integration (OneLake destination) |
++| `endpoint` | Fabric API base URL, defaults to `https://api.fabric.microsoft.com/v1` |
++| `session_name` | Spark session name shown in the Fabric monitoring UI |
++| `environment_id` | Pin sessions to a Fabric Environment (custom pool/libraries) |
++| `spark_config` | Extra Spark conf key/values for the session |
++| `high_concurrency` | Run parallel assets concurrently in one Spark app (default `false`) |
++| `session_tag` | REPL packing key for high-concurrency mode |
++| `max_concurrent_repls` | REPL pool cap in high-concurrency mode (default 4) |
++| `session_start_timeout_seconds` | Session cold-start budget (default 600) |
++| `statement_timeout_seconds` | Per-statement budget (default 43200; 0 = unlimited) |
++
++## Assets
++
++### `fabric.spark.sql`
++
++Runs Spark SQL against the lakehouse with full materialization support:
++
++```bruin-sql
++/* @bruin
++name: reporting.daily_counts
++type: fabric.spark.sql
++materialization:
++  type: table
++  strategy: merge
++columns:
++  - name: event_date
++    type: date
++    primary_key: true
++  - name: event_count
++    type: bigint
++    update_on_merge: true
++@bruin */
++
++SELECT event_date, COUNT(*) AS event_count
++FROM raw.events
++GROUP BY event_date
++```
++
++Supported strategies: `create+replace` (with `partition_by` or `cluster_by`),
++`append`, `merge`, `delete+insert`, `truncate+insert`, `time_interval`,
++`ddl`, `scd2_by_column`, `scd2_by_time`, and `anti_join`.
++
++`anti_join` is an insert-only incremental: rows whose (possibly compound)
++business key — the asset's `primary_key` columns — already exist in the
++target are skipped via a null-safe `LEFT ANTI JOIN`, so re-runs never
++duplicate or update rows. Adding `incremental_key` + `time_granularity`
++bounds the target-side scan to the run window for cheap joins on large
++tables.
++
++The SCD2 strategies run as a single incremental `MERGE` and require Fabric
++runtime 1.3+ (Delta 3.x).
++
++### `fabric.spark.pyspark`
++
++The asset's Python file runs as a PySpark statement in the same Spark
++session as the SQL assets, with `spark` and `sc` predefined and the
++lakehouse as the default catalog:
++
++```bruin-python
++""" @bruin
++name: transform.enrich_events
++type: fabric.spark.pyspark
++depends:
++  - raw.events
++@bruin """
++
++from pyspark.sql import functions as F
++
++events = spark.table("raw.events")
++events.withColumn("processed_at", F.current_timestamp()) \
++    .write.mode("overwrite").saveAsTable("transform.enriched_events")
++```
++
++### `fabric.spark.seed`
++
++Loads a CSV next to the asset file into a Delta table, with types taken from
++the column definitions:
++
++```yaml
++name: raw.countries
++type: fabric.spark.seed
++parameters:
++  path: countries.csv
++```
++
++### Sensors
++
++`fabric.spark.sensor.query` pokes a SQL condition;
++`fabric.spark.sensor.table` waits for a table to exist (probed via
++`SHOW TABLES`, since lakehouses expose no `information_schema`).
++
++## Notes
++
++- One Livy session serves the connection by default; statements share temp
++  views and catalog state across SQL and PySpark assets. A cold Fabric
++  capacity can take minutes to start the session — this cost is paid once
++  per run.
++- With `high_concurrency: true`, the connection pools REPLs from Fabric's
++  `/highConcurrencySessions` API so parallel assets genuinely execute
++  concurrently inside one Spark application.
++- Quality checks are supported, including Spark-specific `accepted_values`
++  and `pattern` (via `RLIKE`).
+diff --git a/pkg/config/connections.go b/pkg/config/connections.go
+index 4ad9059..c29940d 100644
+--- a/pkg/config/connections.go
++++ b/pkg/config/connections.go
+@@ -315,6 +315,41 @@ func (c DatabricksConnection) GetName() string {
+ 	return c.Name
+ }
+ 
++// FabricSparkConnection connects to a Microsoft Fabric Lakehouse through its
++// Livy API, running Spark SQL and PySpark inside a Fabric Spark session.
++type FabricSparkConnection struct {
++	ConnectionMetadata `yaml:",inline" mapstructure:",squash"`
++
++	WorkspaceID   string `yaml:"workspace_id" json:"workspace_id" mapstructure:"workspace_id"`
++	WorkspaceName string `yaml:"workspace_name,omitempty" json:"workspace_name,omitempty" mapstructure:"workspace_name"`
++	LakehouseID   string `yaml:"lakehouse_id" json:"lakehouse_id" mapstructure:"lakehouse_id"`
++	LakehouseName string `yaml:"lakehouse_name" json:"lakehouse_name" mapstructure:"lakehouse_name"`
++	Schema        string `yaml:"schema,omitempty" json:"schema,omitempty" mapstructure:"schema"`
++	Endpoint      string `yaml:"endpoint,omitempty" json:"endpoint,omitempty" mapstructure:"endpoint"`
++
++	TenantID     string `yaml:"tenant_id,omitempty" json:"tenant_id,omitempty" mapstructure:"tenant_id"`
++	ClientID     string `yaml:"client_id,omitempty" json:"client_id,omitempty" mapstructure:"client_id" jsonschema:"oneof_required=service_principal"`
++	ClientSecret string `yaml:"client_secret,omitempty" json:"client_secret,omitempty" mapstructure:"client_secret" jsonschema:"oneof_required=service_principal" sensitive:"true"`
++	AccessToken  string `yaml:"access_token,omitempty" json:"access_token,omitempty" mapstructure:"access_token" jsonschema:"oneof_required=token" sensitive:"true"`
++
++	SessionName   string            `yaml:"session_name,omitempty" json:"session_name,omitempty" mapstructure:"session_name"`
++	EnvironmentID string            `yaml:"environment_id,omitempty" json:"environment_id,omitempty" mapstructure:"environment_id"`
++	SparkConfig   map[string]string `yaml:"spark_config,omitempty" json:"spark_config,omitempty" mapstructure:"spark_config"`
++
++	HighConcurrency    bool   `yaml:"high_concurrency,omitempty" json:"high_concurrency,omitempty" mapstructure:"high_concurrency"`
++	SessionTag         string `yaml:"session_tag,omitempty" json:"session_tag,omitempty" mapstructure:"session_tag"`
++	MaxConcurrentREPLs int    `yaml:"max_concurrent_repls,omitempty" json:"max_concurrent_repls,omitempty" mapstructure:"max_concurrent_repls"`
++
++	HTTPTimeoutSeconds         int `yaml:"http_timeout_seconds,omitempty" json:"http_timeout_seconds,omitempty" mapstructure:"http_timeout_seconds"`
++	SessionStartTimeoutSeconds int `yaml:"session_start_timeout_seconds,omitempty" json:"session_start_timeout_seconds,omitempty" mapstructure:"session_start_timeout_seconds"`
++	StatementTimeoutSeconds    int `yaml:"statement_timeout_seconds,omitempty" json:"statement_timeout_seconds,omitempty" mapstructure:"statement_timeout_seconds"`
++	PollIntervalMillis         int `yaml:"poll_interval_millis,omitempty" json:"poll_interval_millis,omitempty" mapstructure:"poll_interval_millis"`
++}
++
++func (c FabricSparkConnection) GetName() string {
++	return c.Name
++}
++
+ type MongoConnection struct {
+ 	ConnectionMetadata `yaml:",inline" mapstructure:",squash"`
+ 	Username           string `yaml:"username,omitempty" json:"username" mapstructure:"username"`
+diff --git a/pkg/config/manager.go b/pkg/config/manager.go
+index 8bf05e6..abb1887 100644
+--- a/pkg/config/manager.go
++++ b/pkg/config/manager.go
+@@ -33,6 +33,7 @@ type Connections struct {
+ 	RedShift            []RedshiftConnection            `yaml:"redshift,omitempty" json:"redshift,omitempty" mapstructure:"redshift"`
+ 	MsSQL               []MsSQLConnection               `yaml:"mssql,omitempty" json:"mssql,omitempty" mapstructure:"mssql"`
+ 	Databricks          []DatabricksConnection          `yaml:"databricks,omitempty" json:"databricks,omitempty" mapstructure:"databricks"`
++	FabricSpark         []FabricSparkConnection         `yaml:"fabric_spark,omitempty" json:"fabric_spark,omitempty" mapstructure:"fabric_spark"`
+ 	ADLS                []ADLSConnection                `yaml:"adls,omitempty" json:"adls,omitempty" mapstructure:"adls"`
+ 	Synapse             []SynapseConnection             `yaml:"synapse,omitempty" json:"synapse,omitempty" mapstructure:"synapse"`
+ 	Fabric              []FabricConnection              `yaml:"fabric,omitempty" json:"fabric,omitempty" mapstructure:"fabric"`
+@@ -840,6 +841,13 @@ func (c *Config) AddConnection(environmentName, name, connType string, creds map
+ 		}
+ 		conn.Name = name
+ 		env.Connections.MsSQL = append(env.Connections.MsSQL, conn)
++	case "fabric_spark":
++		var conn FabricSparkConnection
++		if err := mapstructure.Decode(creds, &conn); err != nil {
++			return fmt.Errorf("failed to decode credentials: %w", err)
++		}
++		conn.Name = name
++		env.Connections.FabricSpark = append(env.Connections.FabricSpark, conn)
+ 	case "databricks":
+ 		var conn DatabricksConnection
+ 		if err := mapstructure.Decode(creds, &conn); err != nil {
+@@ -1865,6 +1873,8 @@ func (c *Config) DeleteConnection(environmentName, connectionName string) error
+ 		env.Connections.MsSQL = removeConnection(env.Connections.MsSQL, connectionName)
+ 	case "databricks":
+ 		env.Connections.Databricks = removeConnection(env.Connections.Databricks, connectionName)
++	case "fabric_spark":
++		env.Connections.FabricSpark = removeConnection(env.Connections.FabricSpark, connectionName)
+ 	case "adls":
+ 		env.Connections.ADLS = removeConnection(env.Connections.ADLS, connectionName)
+ 	case "mongo":
+@@ -2247,6 +2257,7 @@ func (c *Connections) MergeFrom(source *Connections) error {
+ 	mergeConnectionList(&c.RedShift, source.RedShift)
+ 	mergeConnectionList(&c.MsSQL, source.MsSQL)
+ 	mergeConnectionList(&c.Databricks, source.Databricks)
++	mergeConnectionList(&c.FabricSpark, source.FabricSpark)
+ 	mergeConnectionList(&c.ADLS, source.ADLS)
+ 	mergeConnectionList(&c.Synapse, source.Synapse)
+ 	mergeConnectionList(&c.Fabric, source.Fabric)
+diff --git a/pkg/connection/connection.go b/pkg/connection/connection.go
+index e292d6f..e33ed09 100644
+--- a/pkg/connection/connection.go
++++ b/pkg/connection/connection.go
+@@ -54,6 +54,7 @@ import (
+ 	"github.com/bruin-data/bruin/pkg/emr_serverless"
+ 	"github.com/bruin-data/bruin/pkg/espn"
+ 	fabric "github.com/bruin-data/bruin/pkg/fabric"
++	"github.com/bruin-data/bruin/pkg/fabricspark"
+ 	"github.com/bruin-data/bruin/pkg/facebookads"
+ 	"github.com/bruin-data/bruin/pkg/fastspring"
+ 	"github.com/bruin-data/bruin/pkg/fireflies"
+@@ -162,6 +163,7 @@ type Manager struct {
+ 	Postgres             map[string]*postgres.Client
+ 	MsSQL                map[string]*mssql.DB
+ 	Databricks           map[string]*databricks.DB
++	FabricSpark          map[string]*fabricspark.DB
+ 	ADLS                 map[string]*adls.Client
+ 	Fabric               map[string]*fabric.DB
+ 	OneLake              map[string]*onelake.Client
+@@ -1139,6 +1141,48 @@ func (m *Manager) AddOneLakeConnectionFromConfig(connection *config.OneLakeConne
+ 	return nil
+ }
+ 
++func (m *Manager) AddFabricSparkConnectionFromConfig(connection *config.FabricSparkConnection) error {
++	m.mutex.Lock()
++	if m.FabricSpark == nil {
++		m.FabricSpark = make(map[string]*fabricspark.DB)
++	}
++	m.mutex.Unlock()
++
++	client, err := fabricspark.NewDB(&fabricspark.Config{
++		WorkspaceID:                connection.WorkspaceID,
++		WorkspaceName:              connection.WorkspaceName,
++		LakehouseID:                connection.LakehouseID,
++		LakehouseName:              connection.LakehouseName,
++		SchemaName:                 connection.Schema,
++		Endpoint:                   connection.Endpoint,
++		TenantID:                   connection.TenantID,
++		ClientID:                   connection.ClientID,
++		ClientSecret:               connection.ClientSecret,
++		AccessToken:                connection.AccessToken,
++		SessionName:                connection.SessionName,
++		EnvironmentID:              connection.EnvironmentID,
++		SparkConfig:                connection.SparkConfig,
++		HighConcurrency:            connection.HighConcurrency,
++		SessionTag:                 connection.SessionTag,
++		MaxConcurrentREPLs:         connection.MaxConcurrentREPLs,
++		HTTPTimeoutSeconds:         connection.HTTPTimeoutSeconds,
++		SessionStartTimeoutSeconds: connection.SessionStartTimeoutSeconds,
++		StatementTimeoutSeconds:    connection.StatementTimeoutSeconds,
++		PollIntervalMillis:         connection.PollIntervalMillis,
++	})
++	if err != nil {
++		return err
++	}
++
++	m.mutex.Lock()
++	defer m.mutex.Unlock()
++	m.FabricSpark[connection.Name] = client
++	m.availableConnections[connection.Name] = client
++	m.AllConnectionDetails[connection.Name] = connection
++
++	return nil
++}
++
+ func (m *Manager) AddDatabricksConnectionFromConfig(connection *config.DatabricksConnection) error {
+ 	m.mutex.Lock()
+ 	if m.Databricks == nil {
+@@ -4135,6 +4179,7 @@ func NewManagerFromConfigWithContext(ctx context.Context, cm *config.Config) (co
+ 	processConnections(cm.SelectedEnvironment.Connections.Fabric, connectionManager.AddFabricConnectionFromConfig, &wg, &errList, &mu)
+ 	processConnections(cm.SelectedEnvironment.Connections.OneLake, connectionManager.AddOneLakeConnectionFromConfig, &wg, &errList, &mu)
+ 	processConnections(cm.SelectedEnvironment.Connections.Databricks, connectionManager.AddDatabricksConnectionFromConfig, &wg, &errList, &mu)
++	processConnections(cm.SelectedEnvironment.Connections.FabricSpark, connectionManager.AddFabricSparkConnectionFromConfig, &wg, &errList, &mu)
+ 	processConnections(cm.SelectedEnvironment.Connections.Mongo, connectionManager.AddMongoConnectionFromConfig, &wg, &errList, &mu)
+ 	processConnections(cm.SelectedEnvironment.Connections.Cassandra, connectionManager.AddCassandraConnectionFromConfig, &wg, &errList, &mu)
+ 	processConnections(cm.SelectedEnvironment.Connections.Couchbase, connectionManager.AddCouchbaseConnectionFromConfig, &wg, &errList, &mu)
+diff --git a/pkg/executor/defaults.go b/pkg/executor/defaults.go
+index 628bb63..e02a87b 100644
+--- a/pkg/executor/defaults.go
++++ b/pkg/executor/defaults.go
+@@ -338,6 +338,36 @@ var DefaultExecutorsV2 = map[pipeline.AssetType]Config{
+ 		scheduler.TaskInstanceTypeCustomCheck:  NoOpOperator{},
+ 		scheduler.TaskInstanceTypeMetadataPush: NoOpOperator{},
+ 	},
++	pipeline.AssetTypeFabricSparkQuery: {
++		scheduler.TaskInstanceTypeMain:         NoOpOperator{},
++		scheduler.TaskInstanceTypeColumnCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeCustomCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeMetadataPush: NoOpOperator{},
++	},
++	pipeline.AssetTypeFabricSparkPySpark: {
++		scheduler.TaskInstanceTypeMain:         NoOpOperator{},
++		scheduler.TaskInstanceTypeColumnCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeCustomCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeMetadataPush: NoOpOperator{},
++	},
++	pipeline.AssetTypeFabricSparkSeed: {
++		scheduler.TaskInstanceTypeMain:         NoOpOperator{},
++		scheduler.TaskInstanceTypeColumnCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeCustomCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeMetadataPush: NoOpOperator{},
++	},
++	pipeline.AssetTypeFabricSparkQuerySensor: {
++		scheduler.TaskInstanceTypeMain:         NoOpOperator{},
++		scheduler.TaskInstanceTypeColumnCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeCustomCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeMetadataPush: NoOpOperator{},
++	},
++	pipeline.AssetTypeFabricSparkTableSensor: {
++		scheduler.TaskInstanceTypeMain:         NoOpOperator{},
++		scheduler.TaskInstanceTypeColumnCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeCustomCheck:  NoOpOperator{},
++		scheduler.TaskInstanceTypeMetadataPush: NoOpOperator{},
++	},
+ 	pipeline.AssetTypeDatabricksQuerySensor: {
+ 		scheduler.TaskInstanceTypeMain:         NoOpOperator{},
+ 		scheduler.TaskInstanceTypeColumnCheck:  NoOpOperator{},
+diff --git a/pkg/fabricspark/bruin_funcs.go b/pkg/fabricspark/bruin_funcs.go
+new file mode 100644
+index 0000000..65e2c89
+--- /dev/null
++++ b/pkg/fabricspark/bruin_funcs.go
+@@ -0,0 +1,21 @@
++package fabricspark
++
++import (
++	"fmt"
++
++	"github.com/bruin-data/bruin/pkg/ansisql"
++	"github.com/bruin-data/bruin/pkg/jinja"
++)
++
++// Fabric Lakehouse Spark speaks Spark SQL, so the jinja helper overrides
++// mirror the Databricks ones.
++func init() { //nolint:gochecknoinits
++	jinja.RegisterPlatformOverrides(jinja.PlatformFabricSpark, jinja.MergeBuiltinOverrides(jinja.SparkURLHelpers(), map[string]any{
++		"generate_surrogate_key": jinja.SurrogateKeyWith("string", func(expr string) string {
++			return fmt.Sprintf("md5(%s)", expr)
++		}),
++		"deduplicate": ansisql.DeduplicateQualify,
++		"pivot":       jinja.PivotWithIdentifierQuote(jinja.BacktickQuoteIdentifier),
++		"date_spine":  jinja.SparkDateSpine,
++	}))
++}
+diff --git a/pkg/fabricspark/checks.go b/pkg/fabricspark/checks.go
+new file mode 100644
+index 0000000..0236d7a
+--- /dev/null
++++ b/pkg/fabricspark/checks.go
+@@ -0,0 +1,77 @@
++package fabricspark
++
++import (
++	"context"
++	"fmt"
++	"strconv"
++	"strings"
++
++	"github.com/bruin-data/bruin/pkg/ansisql"
++	"github.com/bruin-data/bruin/pkg/config"
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/bruin-data/bruin/pkg/scheduler"
++	"github.com/pkg/errors"
++)
++
++// AcceptedValuesCheck verifies that a column only contains values from the
++// configured list, using Spark's CAST-to-STRING comparison.
++type AcceptedValuesCheck struct {
++	conn config.ConnectionGetter
++}
++
++// Check implements the accepted_values column check.
++func (c *AcceptedValuesCheck) Check(ctx context.Context, ti *scheduler.ColumnCheckInstance) error {
++	if ti.Check.Value.StringArray == nil && ti.Check.Value.IntArray == nil {
++		return errors.Errorf("unexpected value for accepted_values check, the values must be an array, instead %T", ti.Check.Value)
++	}
++
++	if ti.Check.Value.StringArray != nil && len(*ti.Check.Value.StringArray) == 0 {
++		return errors.Errorf("no values provided for accepted_values check")
++	}
++
++	if ti.Check.Value.IntArray != nil && len(*ti.Check.Value.IntArray) == 0 {
++		return errors.Errorf("no values provided for accepted_values check")
++	}
++
++	var val []string
++	if ti.Check.Value.StringArray != nil {
++		val = *ti.Check.Value.StringArray
++	} else {
++		for _, v := range *ti.Check.Value.IntArray {
++			val = append(val, strconv.Itoa(v))
++		}
++	}
++
++	res := strings.Join(val, "','")
++	res = fmt.Sprintf("'%s'", res)
++
++	qq := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE CAST(%s AS STRING) NOT IN (%s)", ti.GetAsset().Name, ti.Column.Name, res)
++
++	return ansisql.NewCountableQueryCheck(c.conn, 0, &query.Query{Query: qq}, "accepted_values", func(count int64) error {
++		return errors.Errorf("column '%s' has %d rows that are not in the accepted values", ti.Column.Name, count)
++	}).Check(ctx, ti)
++}
++
++// PatternCheck verifies that a column matches a regular expression using
++// Spark's RLIKE operator.
++type PatternCheck struct {
++	conn config.ConnectionGetter
++}
++
++// Check implements the pattern column check.
++func (c *PatternCheck) Check(ctx context.Context, ti *scheduler.ColumnCheckInstance) error {
++	if ti.Check.Value.String == nil {
++		return errors.Errorf("unexpected value %s for pattern check, the value must be a string", ti.Check.Value.ToString())
++	}
++
++	qq := fmt.Sprintf(
++		"SELECT COUNT(*) FROM %s WHERE %s NOT RLIKE '%s'",
++		ti.GetAsset().Name,
++		ti.Column.Name,
++		*ti.Check.Value.String,
++	)
++
++	return ansisql.NewCountableQueryCheck(c.conn, 0, &query.Query{Query: qq}, "pattern", func(count int64) error {
++		return errors.Errorf("column %s has %d values that don't satisfy the pattern %s", ti.Column.Name, count, *ti.Check.Value.String)
++	}).Check(ctx, ti)
++}
+diff --git a/pkg/fabricspark/config.go b/pkg/fabricspark/config.go
+new file mode 100644
+index 0000000..78e981a
+--- /dev/null
++++ b/pkg/fabricspark/config.go
+@@ -0,0 +1,174 @@
++// Package fabricspark implements a Bruin connector for Microsoft Fabric
++// Lakehouses, using Spark SQL as the primary compute engine with the ability
++// to run PySpark when needed.
++//
++// The connector talks to the Fabric Lakehouse Livy API — the same interface
++// used by Microsoft's dbt-fabricspark adapter — so SQL and PySpark statements
++// execute inside a Fabric Spark session against the lakehouse's Delta tables.
++package fabricspark
++
++import (
++	"fmt"
++	"net/url"
++	"regexp"
++	"strings"
++
++	"github.com/pkg/errors"
++)
++
++const (
++	// DefaultEndpoint is the public Microsoft Fabric REST API base URL.
++	DefaultEndpoint = "https://api.fabric.microsoft.com/v1"
++
++	// DefaultScope is the Azure AD scope used to acquire tokens for the
++	// Fabric Livy API. This mirrors dbt-fabricspark's AZURE_CREDENTIAL_SCOPE.
++	DefaultScope = "https://analysis.windows.net/powerbi/api/.default"
++
++	// LivyAPIVersion is the Fabric Lakehouse Livy API version segment.
++	LivyAPIVersion = "2023-12-01"
++
++	// DefaultSessionName is the Spark session name shown in the Fabric
++	// monitoring UI when the user doesn't configure one.
++	DefaultSessionName = "bruin-fabric-spark"
++)
++
++var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
++
++// Config holds everything needed to reach a Fabric Lakehouse Spark endpoint.
++//
++// Authentication supports two modes:
++//   - Service principal: TenantID + ClientID + ClientSecret (client-credentials flow)
++//   - Static token: AccessToken (e.g. produced by `az account get-access-token
++//     --scope "https://analysis.windows.net/powerbi/api/.default"`)
++type Config struct {
++	// WorkspaceID is the Fabric workspace GUID that contains the lakehouse.
++	WorkspaceID string
++	// WorkspaceName is the workspace display name; only needed for ingestr
++	// integration, where the OneLake URI is name-based.
++	WorkspaceName string
++	// LakehouseID is the lakehouse item GUID.
++	LakehouseID string
++	// LakehouseName is the display name of the lakehouse; it doubles as the
++	// database name for non-schema lakehouses.
++	LakehouseName string
++	// SchemaName is the default schema for schema-enabled lakehouses
++	// (optional; e.g. "dbo").
++	SchemaName string
++	// Endpoint is the Fabric REST API base URL; defaults to DefaultEndpoint.
++	Endpoint string
++
++	// TenantID, ClientID and ClientSecret configure service-principal auth.
++	TenantID     string
++	ClientID     string
++	ClientSecret string
++	// AccessToken is a pre-acquired bearer token; takes precedence over the
++	// service-principal fields when set.
++	AccessToken string
++	// Scope overrides the Azure AD scope; defaults to DefaultScope.
++	Scope string
++
++	// SessionName names the Livy session in the Fabric monitoring UI.
++	SessionName string
++	// EnvironmentID optionally pins the session to a Fabric Environment
++	// (custom pool / libraries).
++	EnvironmentID string
++	// SparkConfig holds extra spark conf key/values applied to the session,
++	// e.g. {"spark.sql.caseSensitive": "true"}.
++	SparkConfig map[string]string
++
++	// HighConcurrency switches the connection to Fabric's
++	// /highConcurrencySessions API: multiple REPLs are packed onto one Spark
++	// application and parallel assets execute concurrently instead of
++	// queueing on a single interpreter.
++	HighConcurrency bool
++	// SessionTag is the packing key for high-concurrency REPLs; acquires
++	// sharing a tag land on the same Spark application. Defaults to a random
++	// per-process tag. Set it explicitly to share one application across
++	// bruin invocations while it stays warm.
++	SessionTag string
++	// MaxConcurrentREPLs caps how many REPLs this connection acquires in
++	// high-concurrency mode. Default 4.
++	MaxConcurrentREPLs int
++
++	// HTTPTimeoutSeconds bounds each HTTP call to the Fabric API. Default 120.
++	HTTPTimeoutSeconds int
++	// SessionStartTimeoutSeconds bounds how long to wait for the Spark
++	// session to become idle. Default 600 (Fabric cold starts can be slow).
++	SessionStartTimeoutSeconds int
++	// StatementTimeoutSeconds bounds how long a single statement may run.
++	// Default 43200 (12h); 0 disables the timeout.
++	StatementTimeoutSeconds int
++	// PollIntervalMillis is the base interval between statement polls. Default 500.
++	PollIntervalMillis int
++}
++
++// Validate checks that the config identifies a lakehouse and carries a usable
++// credential.
++func (c *Config) Validate() error {
++	if c.WorkspaceID == "" {
++		return errors.New("fabric spark connection requires `workspace_id`")
++	}
++	if !uuidPattern.MatchString(c.WorkspaceID) {
++		return fmt.Errorf("`workspace_id` must be a GUID, got %q", c.WorkspaceID)
++	}
++	if c.LakehouseID == "" {
++		return errors.New("fabric spark connection requires `lakehouse_id`")
++	}
++	if !uuidPattern.MatchString(c.LakehouseID) {
++		return fmt.Errorf("`lakehouse_id` must be a GUID, got %q", c.LakehouseID)
++	}
++	if c.LakehouseName == "" {
++		return errors.New("fabric spark connection requires `lakehouse_name`")
++	}
++
++	if c.AccessToken == "" {
++		if c.TenantID == "" || c.ClientID == "" || c.ClientSecret == "" {
++			return errors.New("fabric spark connection requires either `access_token` or the service principal fields `tenant_id`, `client_id` and `client_secret`")
++		}
++	}
++
++	if c.Endpoint != "" {
++		parsed, err := url.Parse(c.Endpoint)
++		if err != nil {
++			return errors.Wrapf(err, "invalid `endpoint` %q", c.Endpoint)
++		}
++		if parsed.Scheme != "https" {
++			return fmt.Errorf("`endpoint` must use https, got %q", c.Endpoint)
++		}
++	}
++
++	return nil
++}
++
++// LivyEndpoint returns the base URL of the lakehouse's Livy API, e.g.
++//
++//	https://api.fabric.microsoft.com/v1/workspaces/<ws>/lakehouses/<lh>/livyapi/versions/2023-12-01
++func (c *Config) LivyEndpoint() string {
++	endpoint := c.Endpoint
++	if endpoint == "" {
++		endpoint = DefaultEndpoint
++	}
++	endpoint = strings.TrimSuffix(endpoint, "/")
++
++	return fmt.Sprintf("%s/workspaces/%s/lakehouses/%s/livyapi/versions/%s", endpoint, c.WorkspaceID, c.LakehouseID, LivyAPIVersion)
++}
++
++// GetIngestrURI maps the connection onto ingestr's OneLake destination, so
++// the same lakehouse this connector transforms with Spark can also be an
++// ingestr load target. The OneLake URI is name-based, so `workspace_name`
++// must be configured (the lakehouse name is always known); ingestr's OneLake
++// destination authenticates with the same service principal. Returns empty —
++// meaning "no ingestr support" — when workspace_name or the service
++// principal fields are missing (a static access_token cannot be forwarded).
++func (c *Config) GetIngestrURI() string {
++	if c.WorkspaceName == "" || c.TenantID == "" || c.ClientID == "" || c.ClientSecret == "" {
++		return ""
++	}
++
++	params := url.Values{}
++	params.Set("tenant_id", c.TenantID)
++	params.Set("client_id", c.ClientID)
++	params.Set("client_secret", c.ClientSecret)
++
++	return fmt.Sprintf("onelake://%s/%s?%s", url.PathEscape(c.WorkspaceName), url.PathEscape(c.LakehouseName), params.Encode())
++}
+diff --git a/pkg/fabricspark/config_test.go b/pkg/fabricspark/config_test.go
+new file mode 100644
+index 0000000..94828c1
+--- /dev/null
++++ b/pkg/fabricspark/config_test.go
+@@ -0,0 +1,129 @@
++package fabricspark
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func validConfig() *Config {
++	return &Config{
++		WorkspaceID:   "11111111-2222-3333-4444-555555555555",
++		LakehouseID:   "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
++		LakehouseName: "my_lakehouse",
++		TenantID:      "99999999-8888-7777-6666-555555555555",
++		ClientID:      "client-id",
++		ClientSecret:  "client-secret",
++	}
++}
++
++func TestConfigValidate(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name    string
++		mutate  func(c *Config)
++		wantErr string
++	}{
++		{
++			name:   "valid service principal config",
++			mutate: func(c *Config) {},
++		},
++		{
++			name: "valid static token config",
++			mutate: func(c *Config) {
++				c.TenantID, c.ClientID, c.ClientSecret = "", "", ""
++				c.AccessToken = "token"
++			},
++		},
++		{
++			name:    "missing workspace id",
++			mutate:  func(c *Config) { c.WorkspaceID = "" },
++			wantErr: "workspace_id",
++		},
++		{
++			name:    "non-guid workspace id",
++			mutate:  func(c *Config) { c.WorkspaceID = "not-a-guid" },
++			wantErr: "must be a GUID",
++		},
++		{
++			name:    "missing lakehouse id",
++			mutate:  func(c *Config) { c.LakehouseID = "" },
++			wantErr: "lakehouse_id",
++		},
++		{
++			name:    "missing lakehouse name",
++			mutate:  func(c *Config) { c.LakehouseName = "" },
++			wantErr: "lakehouse_name",
++		},
++		{
++			name: "missing credentials entirely",
++			mutate: func(c *Config) {
++				c.TenantID, c.ClientID, c.ClientSecret = "", "", ""
++			},
++			wantErr: "access_token",
++		},
++		{
++			name:    "http endpoint rejected",
++			mutate:  func(c *Config) { c.Endpoint = "http://api.fabric.microsoft.com/v1" },
++			wantErr: "https",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++
++			c := validConfig()
++			tt.mutate(c)
++
++			err := c.Validate()
++			if tt.wantErr == "" {
++				require.NoError(t, err)
++				return
++			}
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), tt.wantErr)
++		})
++	}
++}
++
++func TestConfigLivyEndpoint(t *testing.T) {
++	t.Parallel()
++
++	c := validConfig()
++	assert.Equal(t,
++		"https://api.fabric.microsoft.com/v1/workspaces/11111111-2222-3333-4444-555555555555/lakehouses/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/livyapi/versions/2023-12-01",
++		c.LivyEndpoint(),
++	)
++
++	c.Endpoint = "https://custom.fabric.microsoft.com/v1/"
++	assert.Equal(t,
++		"https://custom.fabric.microsoft.com/v1/workspaces/11111111-2222-3333-4444-555555555555/lakehouses/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/livyapi/versions/2023-12-01",
++		c.LivyEndpoint(),
++	)
++}
++
++func TestConfigGetIngestrURI(t *testing.T) {
++	t.Parallel()
++
++	// Without a workspace name there is no ingestr mapping.
++	assert.Equal(t, "", validConfig().GetIngestrURI())
++
++	// Static-token auth cannot be forwarded to ingestr.
++	c := validConfig()
++	c.WorkspaceName = "Analytics"
++	c.TenantID, c.ClientID, c.ClientSecret = "", "", ""
++	c.AccessToken = "token"
++	assert.Equal(t, "", c.GetIngestrURI())
++
++	// Service principal + workspace name yields the OneLake destination URI.
++	c = validConfig()
++	c.WorkspaceName = "Analytics"
++	uri := c.GetIngestrURI()
++	assert.Contains(t, uri, "onelake://Analytics/my_lakehouse?")
++	assert.Contains(t, uri, "client_id=client-id")
++	assert.Contains(t, uri, "client_secret=client-secret")
++	assert.Contains(t, uri, "tenant_id=99999999-8888-7777-6666-555555555555")
++}
+diff --git a/pkg/fabricspark/db.go b/pkg/fabricspark/db.go
+new file mode 100644
+index 0000000..09c671a
+--- /dev/null
++++ b/pkg/fabricspark/db.go
+@@ -0,0 +1,547 @@
++package fabricspark
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"fmt"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/bruin-data/bruin/pkg/ansisql"
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/pkg/errors"
++)
++
++// DB is the Fabric Lakehouse Spark client. It lazily creates a single Livy
++// session per connection and serializes statements through it, mirroring how
++// a Spark SQL warehouse connection behaves.
++type DB struct {
++	config        *Config
++	client        *LivyClient
++	schemaCreator *ansisql.SchemaCreator
++
++	mu      sync.Mutex
++	session *LivySession
++
++	// High-concurrency mode state: idle REPLs ready for checkout, plus a
++	// count of live acquires so the pool stays within MaxConcurrentREPLs.
++	hcSessionTag string
++	hcPool       chan *HCSession
++	hcLive       int
++}
++
++// NewDB builds a Fabric Spark client from the config. No network calls are
++// made until the first statement runs.
++func NewDB(c *Config) (*DB, error) {
++	if err := c.Validate(); err != nil {
++		return nil, err
++	}
++
++	tokens, err := NewTokenProvider(c)
++	if err != nil {
++		return nil, err
++	}
++
++	db := &DB{
++		config:        c,
++		client:        NewLivyClient(c, tokens),
++		schemaCreator: ansisql.NewSchemaCreator(),
++	}
++
++	if c.HighConcurrency {
++		db.hcSessionTag = c.SessionTag
++		if db.hcSessionTag == "" {
++			db.hcSessionTag = randomSessionTag()
++		}
++		db.hcPool = make(chan *HCSession, db.maxREPLs())
++	}
++
++	return db, nil
++}
++
++func (db *DB) maxREPLs() int {
++	if db.config.MaxConcurrentREPLs > 0 {
++		return db.config.MaxConcurrentREPLs
++	}
++	return 4
++}
++
++func randomSessionTag() string {
++	buf := make([]byte, 8)
++	if _, err := rand.Read(buf); err != nil {
++		// Fall back to a fixed tag; sharing one Spark app is safe, just
++		// coarser packing than intended.
++		return "bruin-fabric-spark"
++	}
++	return "bruin-" + hex.EncodeToString(buf)
++}
++
++// QuoteIdentifier quotes a Spark identifier with backticks, part by part.
++func QuoteIdentifier(identifier string) string {
++	parts := strings.Split(identifier, ".")
++	quoted := make([]string, len(parts))
++	for i, part := range parts {
++		quoted[i] = "`" + strings.ReplaceAll(part, "`", "``") + "`"
++	}
++	return strings.Join(quoted, ".")
++}
++
++func (db *DB) sessionPayload() map[string]any {
++	name := db.config.SessionName
++	if name == "" {
++		name = DefaultSessionName
++	}
++
++	payload := map[string]any{"name": name}
++	if len(db.config.SparkConfig) > 0 {
++		conf := make(map[string]any, len(db.config.SparkConfig))
++		for k, v := range db.config.SparkConfig {
++			conf[k] = v
++		}
++		payload["conf"] = conf
++	}
++	if db.config.EnvironmentID != "" {
++		payload["environmentId"] = db.config.EnvironmentID
++	}
++	return payload
++}
++
++// ensureSession creates the Livy session on first use, or recreates it after
++// Fabric expires it. Callers must hold db.mu.
++func (db *DB) ensureSession(ctx context.Context) (*LivySession, error) {
++	if db.session != nil {
++		return db.session, nil
++	}
++
++	session, err := db.client.CreateSession(ctx, db.sessionPayload())
++	if err != nil {
++		return nil, err
++	}
++	db.session = session
++	return session, nil
++}
++
++// runStatement executes code in the connection's Spark session. In singleton
++// mode statements serialize on one session; in high-concurrency mode each
++// call checks out a REPL from the pool so parallel assets execute
++// concurrently inside the shared Spark application. In both modes a session
++// reported gone by Fabric (expired idle timeout) is transparently recreated
++// once.
++func (db *DB) runStatement(ctx context.Context, code, kind string) (*StatementOutput, error) {
++	if db.config.HighConcurrency {
++		return db.runStatementHC(ctx, code, kind)
++	}
++
++	db.mu.Lock()
++	defer db.mu.Unlock()
++
++	session, err := db.ensureSession(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	statement, err := db.client.SubmitStatement(ctx, session.IDString(), code, kind)
++	var submitErr *StatementSubmitError
++	if errors.As(err, &submitErr) && submitErr.SessionGone() {
++		db.session = nil
++		session, err = db.ensureSession(ctx)
++		if err != nil {
++			return nil, err
++		}
++		statement, err = db.client.SubmitStatement(ctx, session.IDString(), code, kind)
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	return db.client.WaitForStatement(ctx, session.IDString(), statement.ID.String())
++}
++
++// hcAcquirePayload mirrors sessionPayload with the packing tag added.
++func (db *DB) hcAcquirePayload() map[string]any {
++	payload := db.sessionPayload()
++	payload["sessionTag"] = db.hcSessionTag
++	return payload
++}
++
++// checkoutREPL returns an idle REPL, acquiring a new one when the pool is
++// empty and below its cap, or waiting for a return otherwise.
++func (db *DB) checkoutREPL(ctx context.Context) (*HCSession, error) {
++	for {
++		select {
++		case repl := <-db.hcPool:
++			return repl, nil
++		default:
++		}
++
++		db.mu.Lock()
++		if db.hcLive < db.maxREPLs() {
++			db.hcLive++
++			db.mu.Unlock()
++
++			repl, err := db.client.AcquireHCSession(ctx, db.hcAcquirePayload())
++			if err != nil {
++				db.discardREPL(nil)
++				return nil, err
++			}
++			return repl, nil
++		}
++		db.mu.Unlock()
++
++		// Pool exhausted and at cap: wait for a REPL to come back. The wait
++		// is bounded so that when another goroutine's acquire fails (freeing
++		// a live slot without ever putting a REPL in the pool), waiters loop
++		// back and take the slot instead of blocking forever.
++		select {
++		case repl := <-db.hcPool:
++			return repl, nil
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-time.After(250 * time.Millisecond):
++		}
++	}
++}
++
++func (db *DB) returnREPL(repl *HCSession) {
++	db.hcPool <- repl
++}
++
++// discardREPL drops a dead (or failed-to-acquire) REPL from the live count so
++// a replacement can be acquired.
++func (db *DB) discardREPL(repl *HCSession) {
++	db.mu.Lock()
++	db.hcLive--
++	db.mu.Unlock()
++
++	if repl != nil {
++		// Best-effort release; the REPL is likely already gone server-side.
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		_ = db.client.ReleaseHCSession(ctx, repl.HCID)
++	}
++}
++
++func (db *DB) runStatementHC(ctx context.Context, code, kind string) (*StatementOutput, error) {
++	repl, err := db.checkoutREPL(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	statement, err := db.client.SubmitHCStatement(ctx, repl, code, kind)
++	var submitErr *StatementSubmitError
++	if errors.As(err, &submitErr) && submitErr.SessionGone() {
++		// This REPL (or its Spark app) is gone; replace it and retry once.
++		db.discardREPL(repl)
++		repl, err = db.checkoutREPL(ctx)
++		if err != nil {
++			return nil, err
++		}
++		statement, err = db.client.SubmitHCStatement(ctx, repl, code, kind)
++	}
++	if err != nil {
++		db.discardREPL(repl)
++		return nil, err
++	}
++
++	output, err := db.client.WaitForHCStatement(ctx, repl, statement.ID.String())
++	if err != nil {
++		// A Spark-level failure leaves the REPL healthy — keep it warm.
++		// Transport-level failures (timeouts, lost statements) discard it.
++		var failed *StatementFailedError
++		if errors.As(err, &failed) {
++			db.returnREPL(repl)
++		} else {
++			db.discardREPL(repl)
++		}
++		return nil, err
++	}
++
++	db.returnREPL(repl)
++	return output, nil
++}
++
++// runSQL executes a single SQL statement and parses its tabular output.
++func (db *DB) runSQL(ctx context.Context, sql string) (*SQLResult, error) {
++	code := strings.TrimSpace(sanitizeSQL(sql))
++	code = strings.TrimSuffix(code, ";")
++	if code == "" {
++		return &SQLResult{}, nil
++	}
++
++	output, err := db.runStatement(ctx, code, StatementKindSQL)
++	if err != nil {
++		return nil, err
++	}
++	return ParseSQLOutput(output)
++}
++
++// RunQueryWithoutResult executes the query, discarding any result rows.
++// Multi-statement inputs (";"-separated) are executed in order, matching how
++// bruin's materializers emit multiple statements per asset.
++func (db *DB) RunQueryWithoutResult(ctx context.Context, queryObj *query.Query) error {
++	for _, statement := range splitStatements(queryObj.String()) {
++		if _, err := db.runSQL(ctx, statement); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// Select runs the query and returns the rows.
++func (db *DB) Select(ctx context.Context, queryObj *query.Query) ([][]interface{}, error) {
++	result, err := db.runSQL(ctx, queryObj.String())
++	if err != nil {
++		return nil, err
++	}
++	return result.Data, nil
++}
++
++// SelectWithSchema runs the query and returns rows together with column
++// names and types.
++func (db *DB) SelectWithSchema(ctx context.Context, queryObj *query.Query) (*query.QueryResult, error) {
++	result, err := db.runSQL(ctx, queryObj.String())
++	if err != nil {
++		return nil, err
++	}
++
++	out := &query.QueryResult{
++		Columns:     make([]string, 0, len(result.Schema.Fields)),
++		ColumnTypes: make([]string, 0, len(result.Schema.Fields)),
++		Rows:        result.Data,
++	}
++	if out.Rows == nil {
++		out.Rows = [][]interface{}{}
++	}
++	for i := range result.Schema.Fields {
++		field := &result.Schema.Fields[i]
++		out.Columns = append(out.Columns, field.Name)
++		out.ColumnTypes = append(out.ColumnTypes, field.TypeName())
++	}
++	return out, nil
++}
++
++// Ping verifies the connection by running a trivial query. Note that on a
++// cold Fabric capacity this starts a Spark session, which can take minutes.
++func (db *DB) Ping(ctx context.Context) error {
++	err := db.RunQueryWithoutResult(ctx, &query.Query{Query: "SELECT 1"})
++	if err != nil {
++		return errors.Wrap(err, "failed to run test query on Fabric Lakehouse Spark connection")
++	}
++	return nil
++}
++
++// RunPySpark executes PySpark code in the shared session and returns its
++// plain-text output.
++func (db *DB) RunPySpark(ctx context.Context, code string) (string, error) {
++	output, err := db.runStatement(ctx, code, StatementKindPySpark)
++	if err != nil {
++		return "", err
++	}
++	return ParseTextOutput(output), nil
++}
++
++// Close tears down the Livy session (or releases all pooled REPLs in
++// high-concurrency mode), releasing Spark capacity. Safe to call when no
++// session was ever created.
++func (db *DB) Close(ctx context.Context) error {
++	var firstErr error
++
++	if db.hcPool != nil {
++		for {
++			select {
++			case repl := <-db.hcPool:
++				if err := db.client.ReleaseHCSession(ctx, repl.HCID); err != nil && firstErr == nil {
++					firstErr = err
++				}
++				db.mu.Lock()
++				db.hcLive--
++				db.mu.Unlock()
++			default:
++				return firstErr
++			}
++		}
++	}
++
++	db.mu.Lock()
++	defer db.mu.Unlock()
++
++	if db.session == nil {
++		return nil
++	}
++	err := db.client.CloseSession(ctx, db.session.IDString())
++	db.session = nil
++	return err
++}
++
++// GetIngestrURI exposes the connection as an ingestr OneLake destination; see
++// Config.GetIngestrURI for the mapping and its requirements.
++func (db *DB) GetIngestrURI() (string, error) {
++	return db.config.GetIngestrURI(), nil
++}
++
++type annotatedSchemaQueryRunner struct {
++	db           *DB
++	assetName    string
++	pipelineName string
++}
++
++func (r *annotatedSchemaQueryRunner) RunQueryWithoutResult(ctx context.Context, q *query.Query) error {
++	annotatedQuery, err := ansisql.AddAnnotationComment(ctx, q, r.assetName, "schema", r.pipelineName)
++	if err != nil {
++		return errors.Wrap(err, "failed to add schema annotation comment")
++	}
++	return r.db.RunQueryWithoutResult(ctx, annotatedQuery)
++}
++
++// CreateSchemaIfNotExist creates the asset's schema when the asset name is
++// schema-qualified. Only meaningful for schema-enabled lakehouses; for
++// non-schema lakehouses assets use bare table names and this is a no-op.
++func (db *DB) CreateSchemaIfNotExist(ctx context.Context, asset *pipeline.Asset, pipelineName string) error {
++	runner := &annotatedSchemaQueryRunner{
++		db:           db,
++		assetName:    asset.Name,
++		pipelineName: pipelineName,
++	}
++	return db.schemaCreator.CreateSchemaIfNotExist(ctx, runner, asset)
++}
++
++// GetDatabases lists the schemas visible to the session.
++func (db *DB) GetDatabases(ctx context.Context) ([]string, error) {
++	result, err := db.Select(ctx, &query.Query{Query: "SHOW DATABASES"})
++	if err != nil {
++		return nil, errors.Wrap(err, "failed to list Fabric Lakehouse databases")
++	}
++
++	var databases []string
++	for _, row := range result {
++		if len(row) > 0 {
++			if name, ok := row[0].(string); ok {
++				databases = append(databases, name)
++			}
++		}
++	}
++	sort.Strings(databases)
++	return databases, nil
++}
++
++// GetTables lists the tables in a database.
++func (db *DB) GetTables(ctx context.Context, databaseName string) ([]string, error) {
++	if databaseName == "" {
++		return nil, errors.New("database name cannot be empty")
++	}
++
++	result, err := db.Select(ctx, &query.Query{Query: "SHOW TABLES IN " + QuoteIdentifier(databaseName)})
++	if err != nil {
++		return nil, errors.Wrapf(err, "failed to list tables in database %q", databaseName)
++	}
++
++	var tables []string
++	for _, row := range result {
++		// SHOW TABLES returns (namespace, tableName, isTemporary).
++		if len(row) > 1 {
++			if name, ok := row[1].(string); ok {
++				tables = append(tables, name)
++			}
++		}
++	}
++	return tables, nil
++}
++
++// GetColumns describes the columns of a table.
++func (db *DB) GetColumns(ctx context.Context, databaseName, tableName string) ([]*ansisql.DBColumn, error) {
++	if databaseName == "" {
++		return nil, errors.New("database name cannot be empty")
++	}
++	if tableName == "" {
++		return nil, errors.New("table name cannot be empty")
++	}
++
++	q := fmt.Sprintf("DESCRIBE TABLE %s.%s", QuoteIdentifier(databaseName), QuoteIdentifier(tableName))
++	result, err := db.Select(ctx, &query.Query{Query: q})
++	if err != nil {
++		return nil, errors.Wrapf(err, "failed to describe table %s.%s", databaseName, tableName)
++	}
++
++	columns := make([]*ansisql.DBColumn, 0, len(result))
++	for _, row := range result {
++		if len(row) < 2 {
++			continue
++		}
++		name, _ := row[0].(string)
++		colType, _ := row[1].(string)
++		// DESCRIBE emits a partition-info section after a blank/comment row.
++		if name == "" || strings.HasPrefix(name, "#") {
++			break
++		}
++		columns = append(columns, &ansisql.DBColumn{
++			Name: name,
++			Type: colType,
++		})
++	}
++	return columns, nil
++}
++
++// splitStatements splits a SQL string on semicolons at statement boundaries.
++// It respects quotes and line comments so semicolons inside literals survive.
++func splitStatements(sql string) []string {
++	var statements []string
++	var current strings.Builder
++
++	inSingle, inDouble, inBacktick, inLineComment := false, false, false, false
++	runes := []rune(sql)
++	for i := 0; i < len(runes); i++ {
++		ch := runes[i]
++
++		switch {
++		case inLineComment:
++			if ch == '\n' {
++				inLineComment = false
++			}
++		case inSingle:
++			if ch == '\'' {
++				inSingle = false
++			}
++		case inDouble:
++			if ch == '"' {
++				inDouble = false
++			}
++		case inBacktick:
++			if ch == '`' {
++				inBacktick = false
++			}
++		default:
++			switch ch {
++			case '\'':
++				inSingle = true
++			case '"':
++				inDouble = true
++			case '`':
++				inBacktick = true
++			case '-':
++				if i+1 < len(runes) && runes[i+1] == '-' {
++					inLineComment = true
++				}
++			case ';':
++				statements = append(statements, current.String())
++				current.Reset()
++				continue
++			}
++		}
++		current.WriteRune(ch)
++	}
++	if strings.TrimSpace(current.String()) != "" {
++		statements = append(statements, current.String())
++	}
++
++	filtered := make([]string, 0, len(statements))
++	for _, s := range statements {
++		if strings.TrimSpace(s) != "" {
++			filtered = append(filtered, s)
++		}
++	}
++	return filtered
++}
+diff --git a/pkg/fabricspark/db_test.go b/pkg/fabricspark/db_test.go
+new file mode 100644
+index 0000000..c0ccf2c
+--- /dev/null
++++ b/pkg/fabricspark/db_test.go
+@@ -0,0 +1,578 @@
++package fabricspark
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// fakeLivyServer emulates the subset of the Fabric Lakehouse Livy API the
++// connector uses: session lifecycle and statement submit/poll.
++type fakeLivyServer struct {
++	t *testing.T
++
++	mu             sync.Mutex
++	sessions       map[string]string // id -> state
++	nextSessionID  int
++	statements     map[string]fakeStatement // "session/statement" -> statement
++	nextStatement  int
++	submittedCodes []string
++	submittedKinds []string
++
++	// respondWith lets tests shape the output per submitted code.
++	respondWith func(code, kind string) map[string]any
++
++	// killSessions marks sessions that respond 404 to statement submission.
++	killSessions map[string]bool
++
++	// throttleFirstSubmit makes the first statement submission return 429.
++	throttleFirstSubmit bool
++	throttled           bool
++
++	// High-concurrency state.
++	hcAcquires    int
++	hcReleases    []string
++	hcSessionTags []string
++}
++
++type fakeStatement struct {
++	code string
++	kind string
++}
++
++func newFakeLivyServer(t *testing.T) *fakeLivyServer {
++	return &fakeLivyServer{
++		t:            t,
++		sessions:     map[string]string{},
++		statements:   map[string]fakeStatement{},
++		killSessions: map[string]bool{},
++	}
++}
++
++func defaultSQLOutput(code, kind string) map[string]any {
++	if kind == StatementKindPySpark {
++		return map[string]any{
++			"status": "ok",
++			"data":   map[string]any{"text/plain": "pyspark output"},
++		}
++	}
++	return map[string]any{
++		"status": "ok",
++		"data": map[string]any{
++			"application/json": map[string]any{
++				"schema": map[string]any{
++					"fields": []map[string]any{
++						{"name": "id", "type": "long"},
++						{"name": "name", "type": "string"},
++					},
++				},
++				"data": [][]any{{1, "jane"}, {2, "joe"}},
++			},
++		},
++	}
++}
++
++func (f *fakeLivyServer) handler() http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		f.mu.Lock()
++		defer f.mu.Unlock()
++
++		if r.Header.Get("Authorization") != "Bearer test-token" {
++			w.WriteHeader(http.StatusUnauthorized)
++			return
++		}
++
++		path := strings.TrimPrefix(r.URL.Path, "/")
++		parts := strings.Split(path, "/")
++
++		switch {
++		case r.Method == http.MethodPost && path == "sessions":
++			f.nextSessionID++
++			id := fmt.Sprint(f.nextSessionID)
++			f.sessions[id] = "idle"
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": f.nextSessionID, "state": "starting"})
++
++		case r.Method == http.MethodGet && len(parts) == 2 && parts[0] == "sessions":
++			state, ok := f.sessions[parts[1]]
++			if !ok {
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": parts[1], "state": state})
++
++		case r.Method == http.MethodDelete && len(parts) == 2 && parts[0] == "sessions":
++			delete(f.sessions, parts[1])
++			w.WriteHeader(http.StatusOK)
++
++		case r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "statements":
++			sessionID := parts[1]
++			if f.killSessions[sessionID] {
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++			if f.throttleFirstSubmit && !f.throttled {
++				f.throttled = true
++				w.Header().Set("Retry-After", "1")
++				w.WriteHeader(http.StatusTooManyRequests)
++				return
++			}
++
++			var payload struct {
++				Code string `json:"code"`
++				Kind string `json:"kind"`
++			}
++			require.NoError(f.t, json.NewDecoder(r.Body).Decode(&payload))
++
++			f.nextStatement++
++			key := fmt.Sprintf("%s/%d", sessionID, f.nextStatement)
++			f.statements[key] = fakeStatement{code: payload.Code, kind: payload.Kind}
++			f.submittedCodes = append(f.submittedCodes, payload.Code)
++			f.submittedKinds = append(f.submittedKinds, payload.Kind)
++
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": f.nextStatement, "state": "waiting"})
++
++		case r.Method == http.MethodGet && len(parts) == 4 && parts[2] == "statements":
++			key := fmt.Sprintf("%s/%s", parts[1], parts[3])
++			statement, ok := f.statements[key]
++			if !ok {
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++
++			respond := f.respondWith
++			if respond == nil {
++				respond = defaultSQLOutput
++			}
++			output := respond(statement.code, statement.kind)
++			state := "available"
++			if status, _ := output["status"].(string); status == "error" {
++				// Livy reports error output with state=available and
++				// output.status=error; both paths must be handled.
++				state = "available"
++			}
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": parts[3], "state": state, "output": output})
++
++		// --- high-concurrency endpoints ---
++
++		case r.Method == http.MethodPost && path == "highConcurrencySessions":
++			var payload struct {
++				SessionTag string `json:"sessionTag"`
++			}
++			require.NoError(f.t, json.NewDecoder(r.Body).Decode(&payload))
++			f.hcSessionTags = append(f.hcSessionTags, payload.SessionTag)
++
++			f.hcAcquires++
++			hcID := fmt.Sprintf("hc-%d", f.hcAcquires)
++			// The underlying Livy session is shared; each acquire gets a REPL.
++			f.sessions["hc-app"] = "idle"
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": hcID, "state": "Not Started"})
++
++		case r.Method == http.MethodGet && len(parts) == 2 && parts[0] == "highConcurrencySessions":
++			_ = json.NewEncoder(w).Encode(map[string]any{
++				"id":        parts[1],
++				"state":     "Idle",
++				"sessionId": "hc-app",
++				"replId":    "repl-" + parts[1],
++			})
++
++		case r.Method == http.MethodDelete && len(parts) == 2 && parts[0] == "highConcurrencySessions":
++			f.hcReleases = append(f.hcReleases, parts[1])
++			w.WriteHeader(http.StatusOK)
++
++		case r.Method == http.MethodPost && len(parts) == 5 && parts[0] == "highConcurrencySessions" && parts[2] == "repls" && parts[4] == "statements":
++			if f.killSessions[parts[3]] {
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++			var payload struct {
++				Code string `json:"code"`
++				Kind string `json:"kind"`
++			}
++			require.NoError(f.t, json.NewDecoder(r.Body).Decode(&payload))
++
++			f.nextStatement++
++			key := fmt.Sprintf("%s/%d", parts[1], f.nextStatement)
++			f.statements[key] = fakeStatement{code: payload.Code, kind: payload.Kind}
++			f.submittedCodes = append(f.submittedCodes, payload.Code)
++			f.submittedKinds = append(f.submittedKinds, payload.Kind)
++
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": f.nextStatement, "state": "waiting"})
++
++		case r.Method == http.MethodGet && len(parts) == 6 && parts[0] == "highConcurrencySessions" && parts[4] == "statements":
++			key := fmt.Sprintf("%s/%s", parts[1], parts[5])
++			statement, ok := f.statements[key]
++			if !ok {
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++			respond := f.respondWith
++			if respond == nil {
++				respond = defaultSQLOutput
++			}
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": parts[5], "state": "available", "output": respond(statement.code, statement.kind)})
++
++		default:
++			f.t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
++			w.WriteHeader(http.StatusBadRequest)
++		}
++	})
++}
++
++func newTestDB(t *testing.T, server *httptest.Server) *DB {
++	t.Helper()
++
++	c := validConfig()
++	c.AccessToken = "test-token"
++	c.PollIntervalMillis = 1
++	c.HTTPTimeoutSeconds = 10
++	c.SessionStartTimeoutSeconds = 10
++
++	db, err := NewDB(c)
++	require.NoError(t, err)
++	// Point the client at the fake server instead of api.fabric.microsoft.com.
++	db.client.baseURL = server.URL
++	return db
++}
++
++func TestDBSelect(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	rows, err := db.Select(context.Background(), &query.Query{Query: "/* strip me */ SELECT * FROM users;"})
++	require.NoError(t, err)
++
++	require.Len(t, rows, 2)
++	assert.Equal(t, "jane", rows[0][1])
++
++	// The submitted code must be sanitized: block comment stripped, trailing
++	// semicolon removed.
++	require.Len(t, fake.submittedCodes, 1)
++	assert.Equal(t, "SELECT * FROM users", fake.submittedCodes[0])
++	assert.Equal(t, StatementKindSQL, fake.submittedKinds[0])
++}
++
++func TestDBSelectWithSchema(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	result, err := db.SelectWithSchema(context.Background(), &query.Query{Query: "SELECT * FROM users"})
++	require.NoError(t, err)
++
++	assert.Equal(t, []string{"id", "name"}, result.Columns)
++	assert.Equal(t, []string{"long", "string"}, result.ColumnTypes)
++	require.Len(t, result.Rows, 2)
++}
++
++func TestDBRunQueryWithoutResultMultiStatement(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	err := db.RunQueryWithoutResult(context.Background(), &query.Query{
++		Query: "DELETE FROM t WHERE x = ';not a boundary;';\nINSERT INTO t SELECT 1",
++	})
++	require.NoError(t, err)
++
++	require.Len(t, fake.submittedCodes, 2)
++	assert.Equal(t, "DELETE FROM t WHERE x = ';not a boundary;'", fake.submittedCodes[0])
++	assert.Equal(t, "INSERT INTO t SELECT 1", fake.submittedCodes[1])
++}
++
++func TestDBPing(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	require.NoError(t, db.Ping(context.Background()))
++	require.Len(t, fake.submittedCodes, 1)
++	assert.Equal(t, "SELECT 1", fake.submittedCodes[0])
++}
++
++func TestDBRunPySpark(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	output, err := db.RunPySpark(context.Background(), "df = spark.range(3)\nprint(df.count())")
++	require.NoError(t, err)
++	assert.Equal(t, "pyspark output", output)
++
++	require.Len(t, fake.submittedKinds, 1)
++	assert.Equal(t, StatementKindPySpark, fake.submittedKinds[0])
++	assert.Contains(t, fake.submittedCodes[0], "spark.range(3)")
++}
++
++func TestDBStatementErrorIsSurfaced(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	fake.respondWith = func(code, kind string) map[string]any {
++		return map[string]any{
++			"status":    "error",
++			"ename":     "AnalysisException",
++			"evalue":    "Table or view not found: missing_table",
++			"traceback": []string{"line 1", "line 2"},
++		}
++	}
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	_, err := db.Select(context.Background(), &query.Query{Query: "SELECT * FROM missing_table"})
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "Table or view not found")
++}
++
++func TestDBRecreatesExpiredSession(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++
++	// First query establishes session 1.
++	require.NoError(t, db.Ping(context.Background()))
++
++	// Fabric expires the session: subsequent submissions to it 404.
++	fake.mu.Lock()
++	fake.killSessions["1"] = true
++	fake.mu.Unlock()
++
++	// The client must transparently create session 2 and retry.
++	require.NoError(t, db.Ping(context.Background()))
++
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Equal(t, 2, fake.nextSessionID)
++	assert.Len(t, fake.submittedCodes, 2)
++}
++
++func TestDBRetriesThrottledSubmit(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	fake.throttleFirstSubmit = true
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	require.NoError(t, db.Ping(context.Background()))
++	require.Len(t, fake.submittedCodes, 1)
++}
++
++func TestDBClose(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newTestDB(t, server)
++	require.NoError(t, db.Ping(context.Background()))
++	require.NoError(t, db.Close(context.Background()))
++
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Empty(t, fake.sessions)
++}
++
++func TestQuoteIdentifier(t *testing.T) {
++	t.Parallel()
++
++	assert.Equal(t, "`schema`.`table`", QuoteIdentifier("schema.table"))
++	assert.Equal(t, "`weird``name`", QuoteIdentifier("weird`name"))
++}
++
++func TestSplitStatements(t *testing.T) {
++	t.Parallel()
++
++	statements := splitStatements("SELECT 1; -- comment with ; inside\nSELECT ';';SELECT 3")
++	require.Len(t, statements, 3)
++	assert.Equal(t, "SELECT 1", strings.TrimSpace(statements[0]))
++	assert.Contains(t, statements[1], "comment with ; inside")
++	assert.Contains(t, statements[1], "SELECT ';'")
++	assert.Equal(t, "SELECT 3", strings.TrimSpace(statements[2]))
++}
++
++func newHCTestDB(t *testing.T, server *httptest.Server, maxREPLs int) *DB {
++	t.Helper()
++
++	c := validConfig()
++	c.AccessToken = "test-token"
++	c.PollIntervalMillis = 1
++	c.HTTPTimeoutSeconds = 10
++	c.SessionStartTimeoutSeconds = 10
++	c.HighConcurrency = true
++	c.SessionTag = "test-tag"
++	c.MaxConcurrentREPLs = maxREPLs
++
++	db, err := NewDB(c)
++	require.NoError(t, err)
++	db.client.baseURL = server.URL
++	return db
++}
++
++func TestDBHighConcurrencyStatement(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newHCTestDB(t, server, 2)
++	rows, err := db.Select(context.Background(), &query.Query{Query: "SELECT * FROM users"})
++	require.NoError(t, err)
++	require.Len(t, rows, 2)
++
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Equal(t, 1, fake.hcAcquires)
++	assert.Equal(t, []string{"test-tag"}, fake.hcSessionTags)
++}
++
++func TestDBHighConcurrencyReusesREPL(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newHCTestDB(t, server, 4)
++	require.NoError(t, db.Ping(context.Background()))
++	require.NoError(t, db.Ping(context.Background()))
++
++	// Sequential statements must reuse the pooled REPL, not acquire again.
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Equal(t, 1, fake.hcAcquires)
++	assert.Len(t, fake.submittedCodes, 2)
++}
++
++func TestDBHighConcurrencyParallelStatements(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newHCTestDB(t, server, 2)
++
++	var wg sync.WaitGroup
++	errs := make([]error, 6)
++	for i := range errs {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			errs[i] = db.Ping(context.Background())
++		}(i)
++	}
++	wg.Wait()
++
++	for _, err := range errs {
++		require.NoError(t, err)
++	}
++
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Len(t, fake.submittedCodes, 6)
++	// The pool never exceeds its cap.
++	assert.LessOrEqual(t, fake.hcAcquires, 2)
++	assert.GreaterOrEqual(t, fake.hcAcquires, 1)
++}
++
++func TestDBHighConcurrencyRecoversDeadREPL(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newHCTestDB(t, server, 2)
++	require.NoError(t, db.Ping(context.Background()))
++
++	// Kill the first REPL: submissions to it 404 from now on.
++	fake.mu.Lock()
++	fake.killSessions["repl-hc-1"] = true
++	fake.mu.Unlock()
++
++	// The next statement must acquire a fresh REPL and succeed.
++	require.NoError(t, db.Ping(context.Background()))
++
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Equal(t, 2, fake.hcAcquires)
++	assert.Contains(t, fake.hcReleases, "hc-1")
++}
++
++func TestDBHighConcurrencyClose(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newHCTestDB(t, server, 2)
++	require.NoError(t, db.Ping(context.Background()))
++	require.NoError(t, db.Close(context.Background()))
++
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Equal(t, []string{"hc-1"}, fake.hcReleases)
++}
++
++func TestDBHighConcurrencyKeepsREPLOnStatementFailure(t *testing.T) {
++	t.Parallel()
++
++	fake := newFakeLivyServer(t)
++	fake.respondWith = func(code, kind string) map[string]any {
++		return map[string]any{
++			"status": "error",
++			"evalue": "boom",
++		}
++	}
++	server := httptest.NewServer(fake.handler())
++	defer server.Close()
++
++	db := newHCTestDB(t, server, 2)
++	err := db.Ping(context.Background())
++	require.Error(t, err)
++
++	// The REPL survived the Spark-level failure: the next statement reuses
++	// it instead of acquiring a new one.
++	fake.mu.Lock()
++	fake.respondWith = nil
++	fake.mu.Unlock()
++	require.NoError(t, db.Ping(context.Background()))
++
++	fake.mu.Lock()
++	defer fake.mu.Unlock()
++	assert.Equal(t, 1, fake.hcAcquires)
++}
+diff --git a/pkg/fabricspark/livy.go b/pkg/fabricspark/livy.go
+new file mode 100644
+index 0000000..bb970e0
+--- /dev/null
++++ b/pkg/fabricspark/livy.go
+@@ -0,0 +1,661 @@
++package fabricspark
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/pkg/errors"
++)
++
++// Statement kinds understood by the Fabric Livy API.
++const (
++	StatementKindSQL     = "sql"
++	StatementKindPySpark = "pyspark"
++)
++
++// Livy session states.
++const (
++	sessionStateIdle         = "idle"
++	sessionStateBusy         = "busy"
++	sessionStateDead         = "dead"
++	sessionStateError        = "error"
++	sessionStateKilled       = "killed"
++	sessionStateShuttingDown = "shutting_down"
++	sessionStateSuccess      = "success"
++)
++
++// Livy statement states.
++const (
++	statementStateAvailable  = "available"
++	statementStateError      = "error"
++	statementStateCancelled  = "cancelled"
++	statementStateCancelling = "cancelling"
++)
++
++// FlexibleID decodes an identifier that Fabric returns sometimes as a JSON
++// number and sometimes as a string (HC session ids are string GUIDs).
++type FlexibleID string
++
++// UnmarshalJSON accepts both `"abc"` and `123`.
++func (f *FlexibleID) UnmarshalJSON(b []byte) error {
++	var s string
++	if err := json.Unmarshal(b, &s); err == nil {
++		*f = FlexibleID(s)
++		return nil
++	}
++	var n json.Number
++	if err := json.Unmarshal(b, &n); err != nil {
++		return err
++	}
++	*f = FlexibleID(n.String())
++	return nil
++}
++
++func (f FlexibleID) String() string { return string(f) }
++
++// LivySession is the subset of the Livy session resource the connector needs.
++type LivySession struct {
++	ID    FlexibleID `json:"id"`
++	State string     `json:"state"`
++	AppID string     `json:"appId"`
++}
++
++// IDString normalizes the session ID, which Fabric returns as a number or a string.
++func (s *LivySession) IDString() string {
++	return s.ID.String()
++}
++
++// LivyStatement is a single code statement executed inside a session.
++type LivyStatement struct {
++	ID     FlexibleID       `json:"id"`
++	State  string           `json:"state"`
++	Output *StatementOutput `json:"output"`
++}
++
++// StatementOutput carries the result (or error) of a finished statement.
++type StatementOutput struct {
++	Status    string                     `json:"status"`
++	EName     string                     `json:"ename"`
++	EValue    string                     `json:"evalue"`
++	Traceback []string                   `json:"traceback"`
++	Data      map[string]json.RawMessage `json:"data"`
++}
++
++// SQLResult is the parsed "application/json" payload of a SQL statement.
++type SQLResult struct {
++	Schema SQLResultSchema `json:"schema"`
++	Data   [][]interface{} `json:"data"`
++}
++
++// SQLResultSchema describes the columns of a SQL result.
++type SQLResultSchema struct {
++	Fields []SQLResultField `json:"fields"`
++}
++
++// SQLResultField is a single column descriptor. Type is a RawMessage because
++// Spark encodes primitive types as strings and complex types as objects.
++type SQLResultField struct {
++	Name string          `json:"name"`
++	Type json.RawMessage `json:"type"`
++}
++
++// TypeName renders the field type as a string, e.g. "string", "long", or the
++// JSON representation for complex types.
++func (f *SQLResultField) TypeName() string {
++	var s string
++	if err := json.Unmarshal(f.Type, &s); err == nil {
++		return s
++	}
++	return string(f.Type)
++}
++
++// LivyClient is a minimal client for the Fabric Lakehouse Livy API.
++type LivyClient struct {
++	baseURL    string
++	tokens     TokenProvider
++	httpClient *http.Client
++
++	sessionStartTimeout time.Duration
++	statementTimeout    time.Duration
++	pollInterval        time.Duration
++}
++
++// NewLivyClient builds a client for the lakehouse identified by the config.
++func NewLivyClient(c *Config, tokens TokenProvider) *LivyClient {
++	httpTimeout := time.Duration(c.HTTPTimeoutSeconds) * time.Second
++	if httpTimeout <= 0 {
++		httpTimeout = 120 * time.Second
++	}
++	sessionStartTimeout := time.Duration(c.SessionStartTimeoutSeconds) * time.Second
++	if sessionStartTimeout <= 0 {
++		sessionStartTimeout = 600 * time.Second
++	}
++	statementTimeout := time.Duration(c.StatementTimeoutSeconds) * time.Second
++	if c.StatementTimeoutSeconds == 0 {
++		statementTimeout = 0 // no timeout
++	}
++	pollInterval := time.Duration(c.PollIntervalMillis) * time.Millisecond
++	if pollInterval <= 0 {
++		pollInterval = 500 * time.Millisecond
++	}
++
++	return &LivyClient{
++		baseURL:             c.LivyEndpoint(),
++		tokens:              tokens,
++		httpClient:          &http.Client{Timeout: httpTimeout},
++		sessionStartTimeout: sessionStartTimeout,
++		statementTimeout:    statementTimeout,
++		pollInterval:        pollInterval,
++	}
++}
++
++const maxRequestAttempts = 5
++
++// doRequest performs an authenticated request with retries on transient
++// failures: network errors, HTTP 429 (honoring Retry-After) and 5xx.
++func (c *LivyClient) doRequest(ctx context.Context, method, path string, payload any) ([]byte, int, error) {
++	var body []byte
++	if payload != nil {
++		var err error
++		body, err = json.Marshal(payload)
++		if err != nil {
++			return nil, 0, errors.Wrap(err, "failed to encode Livy request payload")
++		}
++	}
++
++	var lastErr error
++	for attempt := 0; attempt < maxRequestAttempts; attempt++ {
++		if attempt > 0 {
++			backoff := time.Duration(1<<(attempt-1)) * time.Second
++			select {
++			case <-ctx.Done():
++				return nil, 0, ctx.Err()
++			case <-time.After(backoff):
++			}
++		}
++
++		token, err := c.tokens.Token(ctx)
++		if err != nil {
++			return nil, 0, errors.Wrap(err, "failed to acquire Fabric access token")
++		}
++
++		var reader io.Reader
++		if body != nil {
++			reader = bytes.NewReader(body)
++		}
++		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++		if err != nil {
++			return nil, 0, errors.Wrap(err, "failed to build Livy request")
++		}
++		req.Header.Set("Authorization", "Bearer "+token)
++		req.Header.Set("Content-Type", "application/json")
++
++		resp, err := c.httpClient.Do(req)
++		if err != nil {
++			lastErr = errors.Wrapf(err, "livy request %s %s failed", method, path)
++			continue
++		}
++
++		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
++		resp.Body.Close()
++		if readErr != nil {
++			lastErr = errors.Wrap(readErr, "failed to read Livy response body")
++			continue
++		}
++
++		switch {
++		case resp.StatusCode == http.StatusTooManyRequests:
++			lastErr = fmt.Errorf("livy request %s %s throttled (HTTP 429): %s", method, path, summarizeBody(respBody))
++			if wait := parseRetryAfter(resp.Header.Get("Retry-After")); wait > 0 {
++				select {
++				case <-ctx.Done():
++					return nil, resp.StatusCode, ctx.Err()
++				case <-time.After(wait):
++				}
++			}
++			continue
++		case resp.StatusCode >= 500:
++			lastErr = fmt.Errorf("livy request %s %s failed (HTTP %d): %s", method, path, resp.StatusCode, summarizeBody(respBody))
++			continue
++		default:
++			return respBody, resp.StatusCode, nil
++		}
++	}
++
++	return nil, 0, errors.Wrapf(lastErr, "livy request failed after %d attempts", maxRequestAttempts)
++}
++
++func parseRetryAfter(header string) time.Duration {
++	if header == "" {
++		return 0
++	}
++	if seconds, err := strconv.Atoi(header); err == nil && seconds > 0 {
++		return time.Duration(seconds) * time.Second
++	}
++	return 0
++}
++
++// CreateSession starts a new Spark session and waits until it is idle.
++func (c *LivyClient) CreateSession(ctx context.Context, payload map[string]any) (*LivySession, error) {
++	body, status, err := c.doRequest(ctx, http.MethodPost, "/sessions", payload)
++	if err != nil {
++		return nil, errors.Wrap(err, "failed to create Fabric Spark session")
++	}
++	if status >= 400 {
++		return nil, fmt.Errorf("failed to create Fabric Spark session (HTTP %d): %s", status, summarizeBody(body))
++	}
++
++	var session LivySession
++	if err := json.Unmarshal(body, &session); err != nil {
++		return nil, errors.Wrap(err, "failed to decode Fabric Spark session response")
++	}
++	if session.IDString() == "" {
++		return nil, fmt.Errorf("fabric Spark session response did not contain an id: %s", summarizeBody(body))
++	}
++
++	if err := c.waitForSessionIdle(ctx, session.IDString()); err != nil {
++		return nil, err
++	}
++
++	return &session, nil
++}
++
++// GetSession fetches the current state of a session.
++func (c *LivyClient) GetSession(ctx context.Context, sessionID string) (*LivySession, error) {
++	body, status, err := c.doRequest(ctx, http.MethodGet, "/sessions/"+sessionID, nil)
++	if err != nil {
++		return nil, err
++	}
++	if status >= 400 {
++		return nil, fmt.Errorf("failed to get Fabric Spark session %s (HTTP %d): %s", sessionID, status, summarizeBody(body))
++	}
++
++	var session LivySession
++	if err := json.Unmarshal(body, &session); err != nil {
++		return nil, errors.Wrap(err, "failed to decode Fabric Spark session response")
++	}
++	return &session, nil
++}
++
++// CloseSession deletes the session, releasing its Spark capacity.
++func (c *LivyClient) CloseSession(ctx context.Context, sessionID string) error {
++	body, status, err := c.doRequest(ctx, http.MethodDelete, "/sessions/"+sessionID, nil)
++	if err != nil {
++		return err
++	}
++	if status >= 400 && status != http.StatusNotFound {
++		return fmt.Errorf("failed to close Fabric Spark session %s (HTTP %d): %s", sessionID, status, summarizeBody(body))
++	}
++	return nil
++}
++
++func (c *LivyClient) waitForSessionIdle(ctx context.Context, sessionID string) error {
++	deadline := time.Now().Add(c.sessionStartTimeout)
++	pollWait := 2 * time.Second
++
++	for {
++		if time.Now().After(deadline) {
++			return fmt.Errorf("timed out after %s waiting for Fabric Spark session %s to start; increase `session_start_timeout_seconds` or check capacity availability", c.sessionStartTimeout, sessionID)
++		}
++
++		session, err := c.GetSession(ctx, sessionID)
++		if err != nil {
++			return err
++		}
++
++		switch session.State {
++		case sessionStateIdle:
++			return nil
++		case sessionStateDead, sessionStateError, sessionStateKilled, sessionStateShuttingDown:
++			return fmt.Errorf("fabric Spark session %s failed to start (state: %s)", sessionID, session.State)
++		}
++
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-time.After(pollWait):
++		}
++		if pollWait < 10*time.Second {
++			pollWait += time.Second
++		}
++	}
++}
++
++var blockCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/`)
++
++// sanitizeSQL strips block comments before submission — the Fabric Livy SQL
++// path interpolates the statement into a server-side code block where they
++// can break parsing (dbt-fabricspark does the same).
++func sanitizeSQL(sql string) string {
++	return blockCommentPattern.ReplaceAllString(sql, "\n")
++}
++
++// SubmitStatement submits code to a session and returns the statement handle.
++func (c *LivyClient) SubmitStatement(ctx context.Context, sessionID, code, kind string) (*LivyStatement, error) {
++	return c.submitStatementAt(ctx, "/sessions/"+sessionID+"/statements", code, kind)
++}
++
++// submitStatementAt submits code to any statements collection — the singleton
++// session path or a high-concurrency REPL path.
++func (c *LivyClient) submitStatementAt(ctx context.Context, statementsPath, code, kind string) (*LivyStatement, error) {
++	payload := map[string]any{"code": code, "kind": kind}
++	body, status, err := c.doRequest(ctx, http.MethodPost, statementsPath, payload)
++	if err != nil {
++		return nil, errors.Wrap(err, "failed to submit statement to Fabric Spark session")
++	}
++	if status >= 400 {
++		return nil, &StatementSubmitError{StatusCode: status, Body: summarizeBody(body)}
++	}
++
++	var statement LivyStatement
++	if err := json.Unmarshal(body, &statement); err != nil {
++		return nil, errors.Wrap(err, "failed to decode Livy statement response")
++	}
++	if statement.ID.String() == "" {
++		return nil, fmt.Errorf("livy statement response did not contain an id: %s", summarizeBody(body))
++	}
++	return &statement, nil
++}
++
++// StatementSubmitError distinguishes HTTP-level submit failures so callers
++// can recreate expired sessions on 404.
++type StatementSubmitError struct {
++	StatusCode int
++	Body       string
++}
++
++func (e *StatementSubmitError) Error() string {
++	return fmt.Sprintf("livy statement submit failed (HTTP %d): %s", e.StatusCode, e.Body)
++}
++
++// SessionGone reports whether the error indicates the session no longer exists.
++func (e *StatementSubmitError) SessionGone() bool {
++	return e.StatusCode == http.StatusNotFound
++}
++
++// WaitForStatement polls a statement until it completes, returning its output.
++// A statement that finishes with an error state produces a descriptive error
++// including the Spark evalue and traceback.
++func (c *LivyClient) WaitForStatement(ctx context.Context, sessionID, statementID string) (*StatementOutput, error) {
++	return c.waitForStatementAt(ctx, "/sessions/"+sessionID+"/statements", statementID)
++}
++
++// waitForStatementAt polls a statement in any statements collection until it
++// completes.
++func (c *LivyClient) waitForStatementAt(ctx context.Context, statementsPath, statementID string) (*StatementOutput, error) {
++	var deadline time.Time
++	if c.statementTimeout > 0 {
++		deadline = time.Now().Add(c.statementTimeout)
++	}
++
++	path := statementsPath + "/" + statementID
++	pollWait := c.pollInterval
++	notFoundRetries := 0
++
++	for {
++		if !deadline.IsZero() && time.Now().After(deadline) {
++			return nil, fmt.Errorf("timed out after %s waiting for statement %s; increase `statement_timeout_seconds`", c.statementTimeout, statementID)
++		}
++
++		body, status, err := c.doRequest(ctx, http.MethodGet, path, nil)
++		if err != nil {
++			return nil, err
++		}
++		// A 404 can appear transiently right after submit, before the
++		// statement is registered on the server side.
++		if status == http.StatusNotFound {
++			notFoundRetries++
++			if notFoundRetries > 20 {
++				return nil, fmt.Errorf("statement %s disappeared from the Fabric Spark session (%s)", statementID, statementsPath)
++			}
++			select {
++			case <-ctx.Done():
++				return nil, ctx.Err()
++			case <-time.After(pollWait):
++			}
++			continue
++		}
++		if status >= 400 {
++			return nil, fmt.Errorf("failed to poll statement %s (HTTP %d): %s", statementID, status, summarizeBody(body))
++		}
++
++		var statement LivyStatement
++		if err := json.Unmarshal(body, &statement); err != nil {
++			return nil, errors.Wrap(err, "failed to decode Livy statement poll response")
++		}
++
++		switch statement.State {
++		case statementStateAvailable:
++			return statementResult(&statement)
++		case statementStateError, statementStateCancelled, statementStateCancelling:
++			return nil, statementError(&statement)
++		}
++
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-time.After(pollWait):
++		}
++		if pollWait < 3*time.Second {
++			pollWait += 250 * time.Millisecond
++		}
++	}
++}
++
++func statementResult(statement *LivyStatement) (*StatementOutput, error) {
++	if statement.Output == nil {
++		return &StatementOutput{Status: "ok"}, nil
++	}
++	if statement.Output.Status != "ok" {
++		return nil, statementError(statement)
++	}
++	return statement.Output, nil
++}
++
++// StatementFailedError marks a statement that executed but failed inside
++// Spark (analysis error, runtime exception). The session/REPL that ran it is
++// still healthy — callers pooling sessions can keep reusing it.
++type StatementFailedError struct {
++	Message string
++}
++
++func (e *StatementFailedError) Error() string {
++	return e.Message
++}
++
++func statementError(statement *LivyStatement) error {
++	if statement.Output == nil {
++		return &StatementFailedError{Message: fmt.Sprintf("statement %s finished in state %q without output", statement.ID.String(), statement.State)}
++	}
++
++	message := statement.Output.EValue
++	if message == "" {
++		message = fmt.Sprintf("statement finished in state %q", statement.State)
++	}
++	if len(statement.Output.Traceback) > 0 {
++		traceback := ""
++		for _, line := range statement.Output.Traceback {
++			traceback += line
++		}
++		if len(traceback) > 2048 {
++			traceback = traceback[:2048] + "..."
++		}
++		return &StatementFailedError{Message: fmt.Sprintf("fabric Spark statement failed: %s\n%s", message, traceback)}
++	}
++	return &StatementFailedError{Message: "fabric Spark statement failed: " + message}
++}
++
++// ParseSQLOutput extracts the tabular result of a SQL statement.
++func ParseSQLOutput(output *StatementOutput) (*SQLResult, error) {
++	if output == nil || output.Data == nil {
++		return &SQLResult{}, nil
++	}
++	raw, ok := output.Data["application/json"]
++	if !ok {
++		return &SQLResult{}, nil
++	}
++
++	var result SQLResult
++	if err := json.Unmarshal(raw, &result); err != nil {
++		// Some statements return a bare JSON array of rows.
++		var rows [][]interface{}
++		if arrErr := json.Unmarshal(raw, &rows); arrErr == nil {
++			return &SQLResult{Data: rows}, nil
++		}
++		return nil, errors.Wrap(err, "failed to decode Fabric Spark SQL result")
++	}
++	return &result, nil
++}
++
++// ParseTextOutput extracts the plain-text output of a statement (the shape
++// PySpark statements produce).
++func ParseTextOutput(output *StatementOutput) string {
++	if output == nil || output.Data == nil {
++		return ""
++	}
++	raw, ok := output.Data["text/plain"]
++	if !ok {
++		return ""
++	}
++	var text string
++	if err := json.Unmarshal(raw, &text); err != nil {
++		return string(raw)
++	}
++	return text
++}
++
++// --- High-concurrency sessions ---------------------------------------------
++//
++// Fabric's /highConcurrencySessions endpoint packs multiple REPLs onto a
++// single Spark application, keyed by a shared sessionTag. Statements
++// submitted to different REPLs execute concurrently inside that application,
++// which is how parallel bruin assets avoid queueing on one interpreter.
++
++// HCSession is one acquired REPL inside a shared high-concurrency Spark
++// application.
++type HCSession struct {
++	// HCID is the acquire handle, used for release.
++	HCID string
++	// SessionID is the underlying Livy session hosting the REPLs.
++	SessionID string
++	// ReplID identifies this REPL for statement submission.
++	ReplID string
++}
++
++func (s *HCSession) statementsPath() string {
++	return "/highConcurrencySessions/" + s.SessionID + "/repls/" + s.ReplID + "/statements"
++}
++
++type hcSessionState struct {
++	ID        FlexibleID `json:"id"`
++	State     string     `json:"state"`
++	SessionID string     `json:"sessionId"`
++	ReplID    string     `json:"replId"`
++
++	FabricSessionStateInfo struct {
++		ErrorMessage string `json:"errorMessage"`
++	} `json:"fabricSessionStateInfo"`
++}
++
++// AcquireHCSession acquires a REPL via POST /highConcurrencySessions and
++// waits until Fabric reports it Idle with a sessionId and replId assigned.
++// The payload must carry the sessionTag; acquires sharing a tag are packed
++// onto the same Spark application.
++func (c *LivyClient) AcquireHCSession(ctx context.Context, payload map[string]any) (*HCSession, error) {
++	body, status, err := c.doRequest(ctx, http.MethodPost, "/highConcurrencySessions", payload)
++	if err != nil {
++		return nil, errors.Wrap(err, "failed to acquire Fabric high-concurrency session")
++	}
++	if status >= 400 {
++		return nil, fmt.Errorf("failed to acquire Fabric high-concurrency session (HTTP %d): %s", status, summarizeBody(body))
++	}
++
++	var state hcSessionState
++	if err := json.Unmarshal(body, &state); err != nil {
++		return nil, errors.Wrap(err, "failed to decode high-concurrency session response")
++	}
++	hcID := state.ID.String()
++	if hcID == "" {
++		return nil, fmt.Errorf("high-concurrency acquire response did not contain an id: %s", summarizeBody(body))
++	}
++
++	return c.waitForHCSessionIdle(ctx, hcID)
++}
++
++func (c *LivyClient) waitForHCSessionIdle(ctx context.Context, hcID string) (*HCSession, error) {
++	deadline := time.Now().Add(c.sessionStartTimeout)
++	pollWait := 2 * time.Second
++
++	for {
++		if time.Now().After(deadline) {
++			return nil, fmt.Errorf("timed out after %s waiting for high-concurrency session %s to become idle; increase `session_start_timeout_seconds` or check capacity availability", c.sessionStartTimeout, hcID)
++		}
++
++		body, status, err := c.doRequest(ctx, http.MethodGet, "/highConcurrencySessions/"+hcID, nil)
++		if err != nil {
++			return nil, err
++		}
++		if status >= 400 {
++			return nil, fmt.Errorf("failed to poll high-concurrency session %s (HTTP %d): %s", hcID, status, summarizeBody(body))
++		}
++
++		var state hcSessionState
++		if err := json.Unmarshal(body, &state); err != nil {
++			return nil, errors.Wrap(err, "failed to decode high-concurrency session poll response")
++		}
++
++		switch strings.ToLower(state.State) {
++		case sessionStateIdle:
++			if state.SessionID != "" && state.ReplID != "" {
++				return &HCSession{HCID: hcID, SessionID: state.SessionID, ReplID: state.ReplID}, nil
++			}
++		case sessionStateDead, sessionStateError, sessionStateKilled, sessionStateShuttingDown, "cancelled", "failed":
++			message := state.FabricSessionStateInfo.ErrorMessage
++			if message == "" {
++				message = state.State
++			}
++			return nil, fmt.Errorf("fabric high-concurrency session %s failed to start: %s", hcID, message)
++		}
++
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-time.After(pollWait):
++		}
++		if pollWait < 10*time.Second {
++			pollWait += time.Second
++		}
++	}
++}
++
++// SubmitHCStatement submits code to a high-concurrency REPL.
++func (c *LivyClient) SubmitHCStatement(ctx context.Context, session *HCSession, code, kind string) (*LivyStatement, error) {
++	return c.submitStatementAt(ctx, session.statementsPath(), code, kind)
++}
++
++// WaitForHCStatement polls a high-concurrency REPL statement to completion.
++func (c *LivyClient) WaitForHCStatement(ctx context.Context, session *HCSession, statementID string) (*StatementOutput, error) {
++	return c.waitForStatementAt(ctx, session.statementsPath(), statementID)
++}
++
++// ReleaseHCSession releases one REPL acquire. The underlying Spark
++// application keeps serving any other REPLs in the same packing group and is
++// reaped by Fabric on idle timeout.
++func (c *LivyClient) ReleaseHCSession(ctx context.Context, hcID string) error {
++	body, status, err := c.doRequest(ctx, http.MethodDelete, "/highConcurrencySessions/"+hcID, nil)
++	if err != nil {
++		return err
++	}
++	if status >= 400 && status != http.StatusNotFound {
++		return fmt.Errorf("failed to release high-concurrency session %s (HTTP %d): %s", hcID, status, summarizeBody(body))
++	}
++	return nil
++}
+diff --git a/pkg/fabricspark/materialization.go b/pkg/fabricspark/materialization.go
+new file mode 100644
+index 0000000..2148f41
+--- /dev/null
++++ b/pkg/fabricspark/materialization.go
+@@ -0,0 +1,528 @@
++package fabricspark
++
++import (
++	"fmt"
++	"strings"
++
++	"github.com/bruin-data/bruin/pkg/helpers"
++	"github.com/bruin-data/bruin/pkg/pipeline"
++)
++
++type (
++	// MaterializerFunc converts an asset + rendered query into the list of
++	// Spark SQL statements that materialize it.
++	MaterializerFunc = func(task *pipeline.Asset, query string) ([]string, error)
++	// AssetMaterializationMap maps materialization type/strategy pairs to
++	// their builder.
++	AssetMaterializationMap = map[pipeline.MaterializationType]map[pipeline.MaterializationStrategy]MaterializerFunc
++)
++
++var matMap = AssetMaterializationMap{
++	pipeline.MaterializationTypeView: {
++		pipeline.MaterializationStrategyNone:          viewMaterializer,
++		pipeline.MaterializationStrategyAppend:        errorMaterializer,
++		pipeline.MaterializationStrategyCreateReplace: errorMaterializer,
++		pipeline.MaterializationStrategyDeleteInsert:  errorMaterializer,
++	},
++	pipeline.MaterializationTypeTable: {
++		pipeline.MaterializationStrategyNone:           buildCreateReplaceQuery,
++		pipeline.MaterializationStrategyAppend:         buildAppendQuery,
++		pipeline.MaterializationStrategyCreateReplace:  buildCreateReplaceQuery,
++		pipeline.MaterializationStrategyDeleteInsert:   buildIncrementalQuery,
++		pipeline.MaterializationStrategyTruncateInsert: buildTruncateInsertQuery,
++		pipeline.MaterializationStrategyMerge:          buildMergeQuery,
++		pipeline.MaterializationStrategyTimeInterval:   buildTimeIntervalQuery,
++		pipeline.MaterializationStrategyDDL:            buildDDLQuery,
++		pipeline.MaterializationStrategySCD2ByColumn:   buildSCD2ByColumnQuery,
++		pipeline.MaterializationStrategySCD2ByTime:     buildSCD2ByTimeQuery,
++		pipeline.MaterializationStrategyAntiJoin:       buildAntiJoinQuery,
++	},
++}
++
++func errorMaterializer(asset *pipeline.Asset, query string) ([]string, error) {
++	return nil, fmt.Errorf("materialization strategy %s is not supported for materialization type %s and asset type %s", asset.Materialization.Strategy, asset.Materialization.Type, asset.Type)
++}
++
++func viewMaterializer(asset *pipeline.Asset, query string) ([]string, error) {
++	return []string{
++		fmt.Sprintf("DROP TABLE IF EXISTS %s", asset.Name),
++		fmt.Sprintf("CREATE OR REPLACE VIEW %s AS %s", asset.Name, query),
++	}, nil
++}
++
++func buildAppendQuery(asset *pipeline.Asset, query string) ([]string, error) {
++	return []string{fmt.Sprintf("INSERT INTO %s %s", asset.Name, query)}, nil
++}
++
++func buildIncrementalQuery(task *pipeline.Asset, query string) ([]string, error) {
++	mat := task.Materialization
++
++	if mat.IncrementalKey == "" {
++		return nil, fmt.Errorf("materialization strategy %s requires the `incremental_key` field to be set", pipeline.MaterializationStrategyDeleteInsert)
++	}
++
++	tempViewName := "__bruin_tmp_" + helpers.PrefixGenerator()
++
++	return []string{
++		fmt.Sprintf("CREATE OR REPLACE TEMPORARY VIEW %s AS %s", tempViewName, query),
++		fmt.Sprintf("DELETE FROM %s WHERE %s IN (SELECT DISTINCT %s FROM %s)", task.Name, mat.IncrementalKey, mat.IncrementalKey, tempViewName),
++		fmt.Sprintf("INSERT INTO %s SELECT * FROM %s", task.Name, tempViewName),
++		"DROP VIEW IF EXISTS " + tempViewName,
++	}, nil
++}
++
++func buildTruncateInsertQuery(task *pipeline.Asset, query string) ([]string, error) {
++	// DELETE FROM instead of TRUNCATE: it is supported on every Delta table
++	// in Fabric Spark regardless of runtime version, with the same effect.
++	return []string{
++		"DELETE FROM " + task.Name,
++		fmt.Sprintf("INSERT INTO %s %s", task.Name, strings.TrimSuffix(query, ";")),
++	}, nil
++}
++
++func buildMergeQuery(asset *pipeline.Asset, query string) ([]string, error) {
++	if len(asset.Columns) == 0 {
++		return nil, fmt.Errorf("materialization strategy %s requires the `columns` field to be set", asset.Materialization.Strategy)
++	}
++
++	primaryKeys := asset.ColumnNamesWithPrimaryKey()
++	if len(primaryKeys) == 0 {
++		return nil, fmt.Errorf("materialization strategy %s requires the `primary_key` field to be set on at least one column", asset.Materialization.Strategy)
++	}
++
++	nonPrimaryKeys := asset.ColumnNamesWithUpdateOnMerge()
++	columnNames := asset.ColumnNames()
++
++	on := make([]string, 0, len(primaryKeys))
++	for _, key := range primaryKeys {
++		on = append(on, fmt.Sprintf("target.%s = source.%s", key, key))
++	}
++	onQuery := strings.Join(on, " AND ")
++
++	allColumnValues := strings.Join(columnNames, ", ")
++
++	mergeLines := []string{
++		fmt.Sprintf("MERGE INTO %s target", asset.Name),
++		fmt.Sprintf("USING (%s) source ON %s", strings.TrimSuffix(query, ";"), onQuery),
++	}
++
++	if len(nonPrimaryKeys) > 0 {
++		matchedUpdateStatements := make([]string, 0, len(nonPrimaryKeys))
++		for _, col := range nonPrimaryKeys {
++			matchedUpdateStatements = append(matchedUpdateStatements, fmt.Sprintf("%s = source.%s", col, col))
++		}
++		mergeLines = append(mergeLines, "WHEN MATCHED THEN UPDATE SET "+strings.Join(matchedUpdateStatements, ", "))
++	}
++
++	mergeLines = append(mergeLines, fmt.Sprintf("WHEN NOT MATCHED THEN INSERT(%s) VALUES(%s)", allColumnValues, allColumnValues))
++
++	return []string{strings.Join(mergeLines, "\n")}, nil
++}
++
++func buildCreateReplaceQuery(task *pipeline.Asset, query string) ([]string, error) {
++	mat := task.Materialization
++	query = strings.TrimSuffix(strings.TrimSpace(query), ";")
++
++	// An SCD2 asset under --full-refresh must still be rebuilt with its
++	// bookkeeping columns, not as a plain table.
++	if mat.Strategy == pipeline.MaterializationStrategySCD2ByTime {
++		return buildSCD2ByTimeFullRefresh(task, query)
++	}
++	if mat.Strategy == pipeline.MaterializationStrategySCD2ByColumn {
++		return buildSCD2ByColumnFullRefresh(task, query)
++	}
++
++	partitionBy := ""
++	if mat.PartitionBy != "" {
++		partitionBy = fmt.Sprintf("\nPARTITIONED BY (%s)", mat.PartitionBy)
++	}
++
++	clusterBy := ""
++	if len(mat.ClusterBy) > 0 {
++		// Liquid clustering; requires Fabric runtime 1.3+ (Delta 3.1+).
++		clusterBy = "\nCLUSTER BY (" + strings.Join(mat.ClusterBy, ", ") + ")"
++	}
++	if partitionBy != "" && clusterBy != "" {
++		return nil, fmt.Errorf("`partition_by` and `cluster_by` cannot be used together on Fabric Spark assets")
++	}
++
++	// CREATE OR REPLACE on a Delta table is atomic and keeps table history,
++	// so no temp-table dance is needed.
++	return []string{
++		fmt.Sprintf("CREATE OR REPLACE TABLE %s%s%s\nAS %s", task.Name, partitionBy, clusterBy, query),
++	}, nil
++}
++
++func buildAntiJoinQuery(task *pipeline.Asset, query string) ([]string, error) {
++	primaryKeys := task.ColumnNamesWithPrimaryKey()
++	if len(primaryKeys) == 0 {
++		return nil, fmt.Errorf("materialization strategy %s requires the `primary_key` field to be set on at least one column — the primary-key columns form the (compound) business key for the anti join", pipeline.MaterializationStrategyAntiJoin)
++	}
++
++	mat := task.Materialization
++	if mat.IncrementalKey != "" && mat.TimeGranularity == "" {
++		return nil, fmt.Errorf("materialization strategy %s requires `time_granularity` ('date' or 'timestamp') when `incremental_key` is set, so the target scan can be bounded to the run window", pipeline.MaterializationStrategyAntiJoin)
++	}
++	if mat.TimeGranularity != "" && mat.TimeGranularity != pipeline.MaterializationTimeGranularityTimestamp && mat.TimeGranularity != pipeline.MaterializationTimeGranularityDate {
++		return nil, fmt.Errorf("time_granularity must be either 'date', or 'timestamp'")
++	}
++
++	// Null-safe equality so business-key columns containing NULLs still
++	// dedupe instead of always re-inserting.
++	on := make([]string, 0, len(primaryKeys))
++	for _, key := range primaryKeys {
++		on = append(on, fmt.Sprintf("src.%s <=> tgt.%s", key, key))
++	}
++
++	keyColumns := strings.Join(primaryKeys, ", ")
++	targetSide := fmt.Sprintf("(SELECT %s FROM %s)", keyColumns, task.Name)
++	if mat.IncrementalKey != "" {
++		startVar, endVar := "{{start_timestamp}}", "{{end_timestamp}}"
++		if mat.TimeGranularity == pipeline.MaterializationTimeGranularityDate {
++			startVar, endVar = "{{start_date}}", "{{end_date}}"
++		}
++		targetSide = fmt.Sprintf("(SELECT %s FROM %s WHERE %s BETWEEN '%s' AND '%s')", keyColumns, task.Name, mat.IncrementalKey, startVar, endVar)
++	}
++
++	tempViewName := "__bruin_tmp_" + helpers.PrefixGenerator()
++
++	return []string{
++		fmt.Sprintf("CREATE OR REPLACE TEMPORARY VIEW %s AS %s", tempViewName, query),
++		// Bootstrap the target from the query's own schema so the very first
++		// run works without a manual --full-refresh.
++		fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s AS SELECT * FROM %s WHERE 1 = 0", task.Name, tempViewName),
++		fmt.Sprintf("INSERT INTO %s\nSELECT src.* FROM %s src\nLEFT ANTI JOIN %s tgt ON %s", task.Name, tempViewName, targetSide, strings.Join(on, " AND ")),
++		"DROP VIEW IF EXISTS " + tempViewName,
++	}, nil
++}
++
++func buildTimeIntervalQuery(asset *pipeline.Asset, query string) ([]string, error) {
++	if asset.Materialization.IncrementalKey == "" {
++		return nil, fmt.Errorf("incremental_key is required for time_interval strategy")
++	}
++
++	if asset.Materialization.TimeGranularity == "" {
++		return nil, fmt.Errorf("time_granularity is required for time_interval strategy")
++	}
++
++	if asset.Materialization.TimeGranularity != pipeline.MaterializationTimeGranularityTimestamp && asset.Materialization.TimeGranularity != pipeline.MaterializationTimeGranularityDate {
++		return nil, fmt.Errorf("time_granularity must be either 'date', or 'timestamp'")
++	}
++
++	startVar := "{{start_timestamp}}"
++	endVar := "{{end_timestamp}}"
++	if asset.Materialization.TimeGranularity == pipeline.MaterializationTimeGranularityDate {
++		startVar = "{{start_date}}"
++		endVar = "{{end_date}}"
++	}
++
++	return []string{
++		fmt.Sprintf("DELETE FROM %s WHERE %s BETWEEN '%s' AND '%s'", asset.Name, asset.Materialization.IncrementalKey, startVar, endVar),
++		fmt.Sprintf("INSERT INTO %s %s", asset.Name, query),
++	}, nil
++}
++
++func buildDDLQuery(asset *pipeline.Asset, query string) ([]string, error) {
++	columnDefs := make([]string, 0, len(asset.Columns))
++	for _, col := range asset.Columns {
++		def := fmt.Sprintf("%s %s", col.Name, col.SQLType())
++		// Spark SQL has no PRIMARY KEY constraint; primary keys stay
++		// metadata-only and drive the merge strategy + checks instead.
++		if col.Description != "" {
++			def += fmt.Sprintf(" COMMENT '%s'", strings.ReplaceAll(col.Description, "'", "\\'"))
++		}
++		columnDefs = append(columnDefs, def)
++	}
++
++	partitionBy := ""
++	if asset.Materialization.PartitionBy != "" {
++		partitionBy = fmt.Sprintf("\nPARTITIONED BY (%s)", asset.Materialization.PartitionBy)
++	}
++
++	clusterBy := ""
++	if len(asset.Materialization.ClusterBy) > 0 {
++		clusterBy = "\nCLUSTER BY (" + strings.Join(asset.Materialization.ClusterBy, ", ") + ")"
++	}
++
++	ddl := fmt.Sprintf(
++		"CREATE TABLE IF NOT EXISTS %s (\n%s\n)%s%s",
++		asset.Name,
++		strings.Join(columnDefs, ",\n"),
++		partitionBy,
++		clusterBy,
++	)
++
++	return []string{ddl}, nil
++}
++
++// scd2ReservedColumns are managed by the SCD2 strategies and cannot appear in
++// the asset's column list.
++func scd2CheckReservedColumn(name string) error {
++	switch name {
++	case "_valid_from", "_valid_until", "_is_current":
++		return fmt.Errorf("column name %s is reserved for SCD-2 and cannot be used", name)
++	}
++	return nil
++}
++
++// buildSCD2ByColumnQuery emits an incremental SCD2 merge that closes the
++// current row and inserts a new one whenever any non-key column changed.
++//
++// Requires Fabric runtime 1.3+ (Delta 3.x): the merge uses
++// WHEN NOT MATCHED BY SOURCE to close rows for keys that disappeared from
++// the source.
++func buildSCD2ByColumnQuery(asset *pipeline.Asset, query string) ([]string, error) {
++	query = strings.TrimRight(query, ";")
++
++	primaryKeys := asset.ColumnNamesWithPrimaryKey()
++	if len(primaryKeys) == 0 {
++		return nil, fmt.Errorf("materialization strategy %s requires the `primary_key` field to be set on at least one column", asset.Materialization.Strategy)
++	}
++
++	incrementalKey := asset.Materialization.IncrementalKey
++
++	var (
++		compareConds     = make([]string, 0, len(asset.Columns))
++		compareCondsS1T1 = make([]string, 0, len(asset.Columns))
++		insertCols       = make([]string, 0, len(asset.Columns)+3)
++		insertValues     = make([]string, 0, len(asset.Columns)+3)
++	)
++
++	for _, col := range asset.Columns {
++		if err := scd2CheckReservedColumn(col.Name); err != nil {
++			return nil, err
++		}
++		insertCols = append(insertCols, col.Name)
++		insertValues = append(insertValues, "source."+col.Name)
++		if !col.PrimaryKey {
++			compareConds = append(compareConds, fmt.Sprintf("target.%s != source.%s", col.Name, col.Name))
++			compareCondsS1T1 = append(compareCondsS1T1, fmt.Sprintf("t1.%s != s1.%s", col.Name, col.Name))
++		}
++	}
++
++	insertCols = append(insertCols, "_valid_from", "_valid_until", "_is_current")
++
++	validFromExpr := "CURRENT_TIMESTAMP()"
++	validUntilUpdateExpr := "CURRENT_TIMESTAMP()"
++	if incrementalKey != "" {
++		validFromExpr = "source." + incrementalKey
++		validUntilUpdateExpr = "source." + incrementalKey
++	}
++	insertValues = append(insertValues, validFromExpr, "TIMESTAMP '9999-12-31 00:00:00'", "TRUE")
++
++	pkListUsing := strings.Join(primaryKeys, ", ")
++
++	onConditions := make([]string, 0, len(primaryKeys)+1)
++	for _, pk := range primaryKeys {
++		onConditions = append(onConditions, fmt.Sprintf("target.%s = source.%s", pk, pk))
++	}
++	onConditions = append(onConditions, "target._is_current AND source._is_current")
++	onCondition := strings.Join(onConditions, " AND ")
++
++	var whereCondition, matchedCondition string
++	if len(compareCondsS1T1) > 0 {
++		whereCondition = "(" + strings.Join(compareCondsS1T1, " OR ") + ") AND t1._is_current"
++		matchedCondition = strings.Join(compareConds, " OR ")
++	} else {
++		whereCondition = "FALSE AND t1._is_current"
++		matchedCondition = "FALSE"
++	}
++
++	queryStr := fmt.Sprintf(
++		`
++MERGE INTO %s AS target
++USING (
++  WITH s1 AS (
++    %s
++  )
++  SELECT *, TRUE AS _is_current
++  FROM   s1
++  UNION ALL
++  SELECT s1.*, FALSE AS _is_current
++  FROM   s1
++  JOIN   %s AS t1 USING (%s)
++  WHERE  %s
++) AS source
++ON  %s
++
++WHEN MATCHED AND (
++    %s
++) THEN
++  UPDATE SET
++    _valid_until = %s,
++    _is_current  = FALSE
++
++WHEN NOT MATCHED THEN
++  INSERT (%s)
++  VALUES (%s)
++
++WHEN NOT MATCHED BY SOURCE AND target._is_current = TRUE THEN
++  UPDATE SET
++    _valid_until = CURRENT_TIMESTAMP(),
++    _is_current  = FALSE`,
++		asset.Name,
++		strings.TrimSpace(query),
++		asset.Name,
++		pkListUsing,
++		whereCondition,
++		onCondition,
++		matchedCondition,
++		validUntilUpdateExpr,
++		strings.Join(insertCols, ", "),
++		strings.Join(insertValues, ", "),
++	)
++
++	return []string{strings.TrimSpace(queryStr)}, nil
++}
++
++// buildSCD2ByTimeQuery emits an incremental SCD2 merge driven by the
++// incremental_key timestamp: a newer source row closes the current target row
++// and becomes the new current version.
++//
++// Requires Fabric runtime 1.3+ (Delta 3.x) for WHEN NOT MATCHED BY SOURCE.
++func buildSCD2ByTimeQuery(asset *pipeline.Asset, query string) ([]string, error) {
++	query = strings.TrimRight(query, ";")
++
++	if asset.Materialization.IncrementalKey == "" {
++		return nil, fmt.Errorf("incremental_key is required for scd2_by_time strategy")
++	}
++
++	primaryKeys := asset.ColumnNamesWithPrimaryKey()
++	if len(primaryKeys) == 0 {
++		return nil, fmt.Errorf("materialization strategy %s requires the `primary_key` field to be set on at least one column", asset.Materialization.Strategy)
++	}
++
++	var (
++		insertCols   = make([]string, 0, len(asset.Columns)+3)
++		insertValues = make([]string, 0, len(asset.Columns)+3)
++	)
++	for _, col := range asset.Columns {
++		if err := scd2CheckReservedColumn(col.Name); err != nil {
++			return nil, err
++		}
++		if col.Name == asset.Materialization.IncrementalKey {
++			lcType := strings.ToLower(col.Type)
++			if lcType != "timestamp" && lcType != "date" {
++				return nil, fmt.Errorf("incremental_key must be TIMESTAMP or DATE in scd2_by_time strategy")
++			}
++		}
++		insertCols = append(insertCols, col.Name)
++		insertValues = append(insertValues, "source."+col.Name)
++	}
++
++	pkListUsing := strings.Join(primaryKeys, ", ")
++	incrementalKey := asset.Materialization.IncrementalKey
++
++	insertCols = append(insertCols, "_valid_from", "_valid_until", "_is_current")
++	insertValues = append(insertValues, "source."+incrementalKey, "TIMESTAMP '9999-12-31 00:00:00'", "TRUE")
++
++	joinConds := make([]string, 0, len(primaryKeys)+1)
++	for _, pk := range primaryKeys {
++		joinConds = append(joinConds, fmt.Sprintf("target.%s = source.%s", pk, pk))
++	}
++	joinConds = append(joinConds, "target._is_current AND source._is_current")
++	onCondition := strings.Join(joinConds, " AND ")
++
++	queryStr := fmt.Sprintf(
++		`
++MERGE INTO %s AS target
++USING (
++  WITH s1 AS (
++    %s
++  )
++  SELECT s1.*, TRUE AS _is_current
++  FROM   s1
++  UNION ALL
++  SELECT s1.*, FALSE AS _is_current
++  FROM s1
++  JOIN   %s AS t1 USING (%s)
++  WHERE  t1._valid_from < s1.%s AND t1._is_current
++) AS source
++ON  %s
++
++WHEN MATCHED AND (
++  target._valid_from < source.%s
++) THEN
++  UPDATE SET
++    _valid_until = source.%s,
++    _is_current  = FALSE
++
++WHEN NOT MATCHED THEN
++  INSERT (%s)
++  VALUES (%s)
++
++WHEN NOT MATCHED BY SOURCE AND target._is_current = TRUE THEN
++  UPDATE SET
++    _valid_until = CURRENT_TIMESTAMP(),
++    _is_current  = FALSE`,
++		asset.Name,
++		strings.TrimSpace(query),
++		asset.Name,
++		pkListUsing,
++		incrementalKey,
++		onCondition,
++		incrementalKey,
++		incrementalKey,
++		strings.Join(insertCols, ", "),
++		strings.Join(insertValues, ", "),
++	)
++
++	return []string{strings.TrimSpace(queryStr)}, nil
++}
++
++func buildSCD2ByColumnFullRefresh(asset *pipeline.Asset, query string) ([]string, error) {
++	primaryKeys := asset.ColumnNamesWithPrimaryKey()
++	if len(primaryKeys) == 0 {
++		return nil, fmt.Errorf("materialization strategy 'scd2_by_column' requires the `primary_key` field to be set on at least one column")
++	}
++
++	validFromExpr := "CURRENT_TIMESTAMP()"
++	if asset.Materialization.IncrementalKey != "" {
++		validFromExpr = asset.Materialization.IncrementalKey
++	}
++
++	stmt := fmt.Sprintf(
++		`CREATE OR REPLACE TABLE %s AS
++SELECT
++  %s AS _valid_from,
++  src.*,
++  TIMESTAMP '9999-12-31 00:00:00' AS _valid_until,
++  TRUE AS _is_current
++FROM (
++%s
++) AS src`,
++		asset.Name,
++		validFromExpr,
++		strings.TrimSpace(query),
++	)
++
++	return []string{stmt}, nil
++}
++
++func buildSCD2ByTimeFullRefresh(asset *pipeline.Asset, query string) ([]string, error) {
++	if asset.Materialization.IncrementalKey == "" {
++		return nil, fmt.Errorf("incremental_key is required for scd2_by_time strategy")
++	}
++
++	primaryKeys := asset.ColumnNamesWithPrimaryKey()
++	if len(primaryKeys) == 0 {
++		return nil, fmt.Errorf("materialization strategy 'scd2_by_time' requires the `primary_key` field to be set on at least one column")
++	}
++
++	stmt := fmt.Sprintf(
++		`CREATE OR REPLACE TABLE %s AS
++SELECT
++  %s AS _valid_from,
++  src.*,
++  TIMESTAMP '9999-12-31 00:00:00' AS _valid_until,
++  TRUE AS _is_current
++FROM (
++%s
++) AS src`,
++		asset.Name,
++		asset.Materialization.IncrementalKey,
++		strings.TrimSpace(query),
++	)
++
++	return []string{stmt}, nil
++}
+diff --git a/pkg/fabricspark/materialization_test.go b/pkg/fabricspark/materialization_test.go
+new file mode 100644
+index 0000000..ba7b41d
+--- /dev/null
++++ b/pkg/fabricspark/materialization_test.go
+@@ -0,0 +1,386 @@
++package fabricspark
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestMaterializerRender(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name        string
++		asset       *pipeline.Asset
++		query       string
++		fullRefresh bool
++		want        []string
++		wantErr     string
++	}{
++		{
++			name:  "no materialization passes through",
++			asset: &pipeline.Asset{Name: "events"},
++			query: "SELECT 1",
++			want:  []string{"SELECT 1"},
++		},
++		{
++			name: "view",
++			asset: &pipeline.Asset{
++				Name: "reporting.events_view",
++				Materialization: pipeline.Materialization{
++					Type: pipeline.MaterializationTypeView,
++				},
++			},
++			query: "SELECT * FROM events",
++			want: []string{
++				"DROP TABLE IF EXISTS reporting.events_view",
++				"CREATE OR REPLACE VIEW reporting.events_view AS SELECT * FROM events",
++			},
++		},
++		{
++			name: "table create+replace",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyCreateReplace,
++				},
++			},
++			query: "SELECT * FROM raw.events;",
++			want: []string{
++				"CREATE OR REPLACE TABLE reporting.events\nAS SELECT * FROM raw.events",
++			},
++		},
++		{
++			name: "table create+replace with partitioning",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:        pipeline.MaterializationTypeTable,
++					Strategy:    pipeline.MaterializationStrategyCreateReplace,
++					PartitionBy: "event_date",
++				},
++			},
++			query: "SELECT * FROM raw.events",
++			want: []string{
++				"CREATE OR REPLACE TABLE reporting.events\nPARTITIONED BY (event_date)\nAS SELECT * FROM raw.events",
++			},
++		},
++		{
++			name: "partition_by and cluster_by together fail",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:        pipeline.MaterializationTypeTable,
++					Strategy:    pipeline.MaterializationStrategyCreateReplace,
++					PartitionBy: "event_date",
++					ClusterBy:   []string{"user_id"},
++				},
++			},
++			query:   "SELECT 1",
++			wantErr: "cannot be used together",
++		},
++		{
++			name: "append",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyAppend,
++				},
++			},
++			query: "SELECT * FROM raw.events",
++			want:  []string{"INSERT INTO reporting.events SELECT * FROM raw.events"},
++		},
++		{
++			name: "delete+insert requires incremental key",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyDeleteInsert,
++				},
++			},
++			query:   "SELECT 1",
++			wantErr: "incremental_key",
++		},
++		{
++			name: "truncate+insert uses delete from",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyTruncateInsert,
++				},
++			},
++			query: "SELECT * FROM raw.events",
++			want: []string{
++				"DELETE FROM reporting.events",
++				"INSERT INTO reporting.events SELECT * FROM raw.events",
++			},
++		},
++		{
++			name: "merge",
++			asset: &pipeline.Asset{
++				Name: "reporting.users",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyMerge,
++				},
++				Columns: []pipeline.Column{
++					{Name: "id", PrimaryKey: true},
++					{Name: "name", UpdateOnMerge: true},
++				},
++			},
++			query: "SELECT id, name FROM staging.users",
++			want: []string{
++				"MERGE INTO reporting.users target\n" +
++					"USING (SELECT id, name FROM staging.users) source ON target.id = source.id\n" +
++					"WHEN MATCHED THEN UPDATE SET name = source.name\n" +
++					"WHEN NOT MATCHED THEN INSERT(id, name) VALUES(id, name)",
++			},
++		},
++		{
++			name: "merge requires primary key",
++			asset: &pipeline.Asset{
++				Name: "reporting.users",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyMerge,
++				},
++				Columns: []pipeline.Column{{Name: "id"}},
++			},
++			query:   "SELECT 1",
++			wantErr: "primary_key",
++		},
++		{
++			name: "time interval date granularity",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:            pipeline.MaterializationTypeTable,
++					Strategy:        pipeline.MaterializationStrategyTimeInterval,
++					IncrementalKey:  "event_date",
++					TimeGranularity: pipeline.MaterializationTimeGranularityDate,
++				},
++			},
++			query: "SELECT * FROM raw.events",
++			want: []string{
++				"DELETE FROM reporting.events WHERE event_date BETWEEN '{{start_date}}' AND '{{end_date}}'",
++				"INSERT INTO reporting.events SELECT * FROM raw.events",
++			},
++		},
++		{
++			name: "ddl",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:        pipeline.MaterializationTypeTable,
++					Strategy:    pipeline.MaterializationStrategyDDL,
++					PartitionBy: "event_date",
++				},
++				Columns: []pipeline.Column{
++					{Name: "id", Type: "bigint", PrimaryKey: true},
++					{Name: "event_date", Type: "date", Description: "partition column"},
++				},
++			},
++			want: []string{
++				"CREATE TABLE IF NOT EXISTS reporting.events (\n" +
++					"id bigint,\n" +
++					"event_date date COMMENT 'partition column'\n" +
++					")\nPARTITIONED BY (event_date)",
++			},
++		},
++		{
++			name: "anti join requires primary key",
++			asset: &pipeline.Asset{
++				Name: "reporting.orders",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyAntiJoin,
++				},
++				Columns: []pipeline.Column{{Name: "order_id"}},
++			},
++			query:   "SELECT 1",
++			wantErr: "primary_key",
++		},
++		{
++			name: "anti join with incremental key requires granularity",
++			asset: &pipeline.Asset{
++				Name: "reporting.orders",
++				Materialization: pipeline.Materialization{
++					Type:           pipeline.MaterializationTypeTable,
++					Strategy:       pipeline.MaterializationStrategyAntiJoin,
++					IncrementalKey: "order_ts",
++				},
++				Columns: []pipeline.Column{{Name: "order_id", PrimaryKey: true}},
++			},
++			query:   "SELECT 1",
++			wantErr: "time_granularity",
++		},
++		{
++			name: "full refresh flips anti join to create+replace",
++			asset: &pipeline.Asset{
++				Name: "reporting.orders",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategyAntiJoin,
++				},
++				Columns: []pipeline.Column{{Name: "order_id", PrimaryKey: true}},
++			},
++			query:       "SELECT * FROM raw.orders",
++			fullRefresh: true,
++			want: []string{
++				"CREATE OR REPLACE TABLE reporting.orders\nAS SELECT * FROM raw.orders",
++			},
++		},
++		{
++			name: "incremental scd2 requires primary key",
++			asset: &pipeline.Asset{
++				Name: "reporting.users",
++				Materialization: pipeline.Materialization{
++					Type:     pipeline.MaterializationTypeTable,
++					Strategy: pipeline.MaterializationStrategySCD2ByColumn,
++				},
++			},
++			query:   "SELECT 1",
++			wantErr: "primary_key",
++		},
++		{
++			name: "full refresh flips delete+insert to create+replace",
++			asset: &pipeline.Asset{
++				Name: "reporting.events",
++				Materialization: pipeline.Materialization{
++					Type:           pipeline.MaterializationTypeTable,
++					Strategy:       pipeline.MaterializationStrategyDeleteInsert,
++					IncrementalKey: "dt",
++				},
++			},
++			query:       "SELECT * FROM raw.events",
++			fullRefresh: true,
++			want: []string{
++				"CREATE OR REPLACE TABLE reporting.events\nAS SELECT * FROM raw.events",
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++
++			m := NewMaterializer(tt.fullRefresh)
++			got, err := m.Render(tt.asset, tt.query)
++
++			if tt.wantErr != "" {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), tt.wantErr)
++				return
++			}
++
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, got)
++		})
++	}
++}
++
++func TestMaterializerRenderDeleteInsertShape(t *testing.T) {
++	t.Parallel()
++
++	asset := &pipeline.Asset{
++		Name: "reporting.events",
++		Materialization: pipeline.Materialization{
++			Type:           pipeline.MaterializationTypeTable,
++			Strategy:       pipeline.MaterializationStrategyDeleteInsert,
++			IncrementalKey: "dt",
++		},
++	}
++
++	got, err := NewMaterializer(false).Render(asset, "SELECT * FROM raw.events")
++	require.NoError(t, err)
++	require.Len(t, got, 4)
++	assert.True(t, strings.HasPrefix(got[0], "CREATE OR REPLACE TEMPORARY VIEW __bruin_tmp_"))
++	assert.Contains(t, got[1], "DELETE FROM reporting.events WHERE dt IN (SELECT DISTINCT dt FROM __bruin_tmp_")
++	assert.Contains(t, got[2], "INSERT INTO reporting.events SELECT * FROM __bruin_tmp_")
++	assert.True(t, strings.HasPrefix(got[3], "DROP VIEW IF EXISTS __bruin_tmp_"))
++}
++
++func TestMaterializerRenderAntiJoinCompoundKey(t *testing.T) {
++	t.Parallel()
++
++	asset := &pipeline.Asset{
++		Name: "reporting.orders",
++		Materialization: pipeline.Materialization{
++			Type:     pipeline.MaterializationTypeTable,
++			Strategy: pipeline.MaterializationStrategyAntiJoin,
++		},
++		Columns: []pipeline.Column{
++			{Name: "source_system", PrimaryKey: true},
++			{Name: "order_number", PrimaryKey: true},
++			{Name: "amount"},
++		},
++	}
++
++	got, err := NewMaterializer(false).Render(asset, "SELECT * FROM staging.orders")
++	require.NoError(t, err)
++	require.Len(t, got, 4)
++
++	assert.True(t, strings.HasPrefix(got[0], "CREATE OR REPLACE TEMPORARY VIEW __bruin_tmp_"))
++	assert.Contains(t, got[0], "SELECT * FROM staging.orders")
++
++	// First run bootstraps the target from the query's schema.
++	assert.Contains(t, got[1], "CREATE TABLE IF NOT EXISTS reporting.orders AS SELECT * FROM __bruin_tmp_")
++	assert.Contains(t, got[1], "WHERE 1 = 0")
++
++	// The insert must anti-join on BOTH business-key columns, null-safe, and
++	// only project the key columns from the target.
++	assert.Contains(t, got[2], "INSERT INTO reporting.orders")
++	assert.Contains(t, got[2], "LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders) tgt")
++	assert.Contains(t, got[2], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
++
++	assert.True(t, strings.HasPrefix(got[3], "DROP VIEW IF EXISTS __bruin_tmp_"))
++}
++
++func TestMaterializerRenderAntiJoinWindowBounded(t *testing.T) {
++	t.Parallel()
++
++	asset := &pipeline.Asset{
++		Name: "reporting.orders",
++		Materialization: pipeline.Materialization{
++			Type:            pipeline.MaterializationTypeTable,
++			Strategy:        pipeline.MaterializationStrategyAntiJoin,
++			IncrementalKey:  "order_ts",
++			TimeGranularity: pipeline.MaterializationTimeGranularityTimestamp,
++		},
++		Columns: []pipeline.Column{
++			{Name: "source_system", PrimaryKey: true},
++			{Name: "order_number", PrimaryKey: true},
++		},
++	}
++
++	got, err := NewMaterializer(false).Render(asset, "SELECT * FROM staging.orders")
++	require.NoError(t, err)
++	require.Len(t, got, 4)
++
++	// The target scan is bounded to the run window with the same
++	// placeholders time_interval uses.
++	assert.Contains(t, got[2],
++		"LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders WHERE order_ts BETWEEN '{{start_timestamp}}' AND '{{end_timestamp}}') tgt")
++}
++
++func TestRendererJoinsStatements(t *testing.T) {
++	t.Parallel()
++
++	asset := &pipeline.Asset{
++		Name: "reporting.v",
++		Materialization: pipeline.Materialization{
++			Type: pipeline.MaterializationTypeView,
++		},
++	}
++
++	rendered, err := NewRenderer(false).Render(asset, "SELECT 1")
++	require.NoError(t, err)
++	assert.Equal(t, "DROP TABLE IF EXISTS reporting.v;\nCREATE OR REPLACE VIEW reporting.v AS SELECT 1", rendered)
++}
+diff --git a/pkg/fabricspark/materializer.go b/pkg/fabricspark/materializer.go
+new file mode 100644
+index 0000000..aecf060
+--- /dev/null
++++ b/pkg/fabricspark/materializer.go
+@@ -0,0 +1,91 @@
++package fabricspark
++
++import (
++	"fmt"
++	"io"
++	"strings"
++
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/pkg/errors"
++)
++
++// Materializer renders an asset's query into the list of Spark SQL statements
++// that materialize it. Like the databricks connector, it returns a slice
++// because several strategies need multiple statements sent as separate Livy
++// statements.
++type Materializer struct {
++	MaterializationMap AssetMaterializationMap
++	fullRefresh        bool
++}
++
++// NewMaterializer builds a materializer honoring the --full-refresh flag.
++func NewMaterializer(fullRefresh bool) *Materializer {
++	return &Materializer{
++		MaterializationMap: matMap,
++		fullRefresh:        fullRefresh,
++	}
++}
++
++// Render produces the statements for the asset's materialization settings.
++func (m *Materializer) Render(asset *pipeline.Asset, query string) ([]string, error) {
++	mat := asset.Materialization
++	if mat.Type == pipeline.MaterializationTypeNone {
++		return []string{query}, nil
++	}
++
++	strategy := mat.Strategy
++	if m.fullRefresh && mat.Type == pipeline.MaterializationTypeTable {
++		if mat.Strategy != pipeline.MaterializationStrategyDDL {
++			strategy = pipeline.MaterializationStrategyCreateReplace
++		}
++	}
++
++	query = strings.TrimSuffix(strings.TrimSpace(query), ";")
++	if matFunc, ok := m.MaterializationMap[mat.Type][strategy]; ok {
++		return matFunc(asset, query)
++	}
++
++	return nil, fmt.Errorf("unsupported materialization type - strategy combination: (`%s` - `%s`)", mat.Type, mat.Strategy)
++}
++
++// LogIfFullRefreshAndDDL warns when --full-refresh is combined with the DDL
++// strategy, which intentionally never drops the table.
++func (m *Materializer) LogIfFullRefreshAndDDL(writer interface{}, asset *pipeline.Asset) error {
++	if !m.fullRefresh {
++		return nil
++	}
++	if asset.Materialization.Strategy != pipeline.MaterializationStrategyDDL {
++		return nil
++	}
++	if writer == nil {
++		return errors.New("no writer found in context, please create an issue for this: https://github.com/bruin-data/bruin/issues")
++	}
++
++	message := "Full refresh detected, but DDL strategy is in use — table will NOT be dropped or recreated.\n"
++	writerObj, ok := writer.(io.Writer)
++	if !ok {
++		return errors.New("writer is not an io.Writer")
++	}
++	_, err := writerObj.Write([]byte(message))
++	return err
++}
++
++// Renderer adapts the Materializer to interfaces that expect a single query
++// string; statements are joined with semicolons.
++type Renderer struct {
++	mat *Materializer
++}
++
++// NewRenderer builds a single-string renderer honoring --full-refresh.
++func NewRenderer(fullRefresh bool) *Renderer {
++	return &Renderer{mat: NewMaterializer(fullRefresh)}
++}
++
++// Render renders the materialized statements as a single semicolon-joined string.
++func (r *Renderer) Render(asset *pipeline.Asset, query string) (string, error) {
++	queries, err := r.mat.Render(asset, query)
++	if err != nil {
++		return "", err
++	}
++	return strings.Join(queries, ";\n"), nil
++}
+diff --git a/pkg/fabricspark/operator.go b/pkg/fabricspark/operator.go
+new file mode 100644
+index 0000000..8a3fd79
+--- /dev/null
++++ b/pkg/fabricspark/operator.go
+@@ -0,0 +1,208 @@
++package fabricspark
++
++import (
++	"context"
++	"io"
++
++	"github.com/bruin-data/bruin/pkg/ansisql"
++	"github.com/bruin-data/bruin/pkg/config"
++	"github.com/bruin-data/bruin/pkg/executor"
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/bruin-data/bruin/pkg/scheduler"
++	"github.com/pkg/errors"
++)
++
++type materializer interface {
++	Render(task *pipeline.Asset, query string) ([]string, error)
++	LogIfFullRefreshAndDDL(writer interface{}, asset *pipeline.Asset) error
++}
++
++// Client is the connection interface the operators need; *DB implements it.
++type Client interface {
++	RunQueryWithoutResult(ctx context.Context, query *query.Query) error
++	Select(ctx context.Context, query *query.Query) ([][]interface{}, error)
++	SelectWithSchema(ctx context.Context, query *query.Query) (*query.QueryResult, error)
++	Ping(ctx context.Context) error
++	CreateSchemaIfNotExist(ctx context.Context, asset *pipeline.Asset, pipelineName string) error
++	RunPySpark(ctx context.Context, code string) (string, error)
++}
++
++// BasicOperator runs `fabric.spark.sql` assets: it extracts the query,
++// applies materialization and executes the resulting statements in the
++// lakehouse Spark session.
++type BasicOperator struct {
++	connection   config.ConnectionGetter
++	extractor    query.QueryExtractor
++	materializer materializer
++}
++
++// NewBasicOperator builds the SQL operator.
++func NewBasicOperator(conn config.ConnectionGetter, extractor query.QueryExtractor, materializer materializer) *BasicOperator {
++	return &BasicOperator{
++		connection:   conn,
++		extractor:    extractor,
++		materializer: materializer,
++	}
++}
++
++// Run implements scheduler execution for a task instance.
++func (o BasicOperator) Run(ctx context.Context, ti scheduler.TaskInstance) error {
++	return o.RunTask(ctx, ti.GetPipeline(), ti.GetAsset())
++}
++
++// RunTask executes a single SQL asset.
++func (o BasicOperator) RunTask(ctx context.Context, p *pipeline.Pipeline, t *pipeline.Asset) error {
++	ctx = query.WithQueryType(ctx, query.QueryTypeMain)
++	extractor, err := o.extractor.CloneForAsset(ctx, p, t)
++	if err != nil {
++		return errors.Wrapf(err, "failed to clone extractor for asset %s", t.Name)
++	}
++	queries, err := extractor.ExtractQueriesFromString(t.ExecutableFile.Content)
++	if err != nil {
++		return errors.Wrap(err, "cannot extract queries from the task file")
++	}
++
++	if len(queries) == 0 {
++		return nil
++	}
++
++	if len(queries) > 1 && t.Materialization.Type != pipeline.MaterializationTypeNone {
++		return errors.New("cannot enable materialization for tasks with multiple queries")
++	}
++
++	writer := ctx.Value(executor.KeyPrinter)
++	if err := o.materializer.LogIfFullRefreshAndDDL(writer, t); err != nil {
++		return err
++	}
++
++	materializedQueries, err := o.materializer.Render(t, queries[0].String())
++	if err != nil {
++		return err
++	}
++
++	// Both time_interval and window-bounded anti_join emit {{start_*}} /
++	// {{end_*}} placeholders that must be rendered against the run window.
++	needsWindowRendering := t.Materialization.Strategy == pipeline.MaterializationStrategyTimeInterval ||
++		(t.Materialization.Strategy == pipeline.MaterializationStrategyAntiJoin && t.Materialization.IncrementalKey != "")
++	if needsWindowRendering {
++		materializedQueries, err = extractor.ReextractQueriesFromSlice(materializedQueries)
++		if err != nil {
++			return err
++		}
++	}
++
++	conn, err := o.getClient(ctx, p, t)
++	if err != nil {
++		return err
++	}
++
++	if t.Materialization.Type != pipeline.MaterializationTypeNone {
++		if err := conn.CreateSchemaIfNotExist(ctx, t, p.Name); err != nil {
++			return err
++		}
++	}
++
++	for _, queryString := range materializedQueries {
++		q := &query.Query{Query: queryString}
++		annotatedQuery, err := ansisql.AddAnnotationComment(ctx, q, t.Name, "main", p.Name)
++		if err != nil {
++			return err
++		}
++
++		ansisql.LogQueryIfVerbose(ctx, writer, annotatedQuery.Query)
++
++		if err := conn.RunQueryWithoutResult(ctx, annotatedQuery); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (o BasicOperator) getClient(ctx context.Context, p *pipeline.Pipeline, t *pipeline.Asset) (Client, error) {
++	connName, err := p.GetConnectionNameForAsset(t)
++	if err != nil {
++		return nil, err
++	}
++
++	rawConn := o.connection.GetConnection(connName)
++	if rawConn == nil {
++		return nil, config.NewConnectionNotFoundError(ctx, "", connName)
++	}
++
++	conn, ok := rawConn.(Client)
++	if !ok {
++		return nil, errors.Errorf("connection '%s' is not a fabric spark connection", connName)
++	}
++	return conn, nil
++}
++
++// PySparkOperator runs `fabric.spark.pyspark` assets: the asset file's Python
++// code executes as a PySpark statement inside the shared lakehouse Spark
++// session, with `spark` (SparkSession) and `sc` (SparkContext) predefined.
++type PySparkOperator struct {
++	connection config.ConnectionGetter
++}
++
++// NewPySparkOperator builds the PySpark operator.
++func NewPySparkOperator(conn config.ConnectionGetter) *PySparkOperator {
++	return &PySparkOperator{connection: conn}
++}
++
++// Run implements scheduler execution for a task instance.
++func (o PySparkOperator) Run(ctx context.Context, ti scheduler.TaskInstance) error {
++	return o.RunTask(ctx, ti.GetPipeline(), ti.GetAsset())
++}
++
++// RunTask executes a single PySpark asset.
++func (o PySparkOperator) RunTask(ctx context.Context, p *pipeline.Pipeline, t *pipeline.Asset) error {
++	code := t.ExecutableFile.Content
++	if code == "" {
++		return nil
++	}
++
++	connName, err := p.GetConnectionNameForAsset(t)
++	if err != nil {
++		return err
++	}
++
++	rawConn := o.connection.GetConnection(connName)
++	if rawConn == nil {
++		return config.NewConnectionNotFoundError(ctx, "", connName)
++	}
++
++	conn, ok := rawConn.(Client)
++	if !ok {
++		return errors.Errorf("connection '%s' is not a fabric spark connection", connName)
++	}
++
++	output, err := conn.RunPySpark(ctx, code)
++	if err != nil {
++		return errors.Wrapf(err, "pyspark asset %s failed", t.Name)
++	}
++
++	if output != "" {
++		if writer, ok := ctx.Value(executor.KeyPrinter).(io.Writer); ok && writer != nil {
++			_, _ = writer.Write([]byte(output + "\n"))
++		}
++	}
++
++	return nil
++}
++
++// NewColumnCheckOperator wires the standard ANSI SQL column checks plus the
++// Spark-specific accepted_values and pattern checks.
++func NewColumnCheckOperator(manager config.ConnectionGetter) *ansisql.ColumnCheckOperator {
++	return ansisql.NewColumnCheckOperator(map[string]ansisql.CheckRunner{
++		"not_null":        ansisql.NewNotNullCheck(manager),
++		"unique":          ansisql.NewUniqueCheck(manager),
++		"positive":        ansisql.NewPositiveCheck(manager),
++		"non_negative":    ansisql.NewNonNegativeCheck(manager),
++		"negative":        ansisql.NewNegativeCheck(manager),
++		"min":             ansisql.NewMinCheck(manager),
++		"max":             ansisql.NewMaxCheck(manager),
++		"accepted_values": &AcceptedValuesCheck{conn: manager},
++		"pattern":         &PatternCheck{conn: manager},
++	})
++}
+diff --git a/pkg/fabricspark/operator_test.go b/pkg/fabricspark/operator_test.go
+new file mode 100644
+index 0000000..90e3b92
+--- /dev/null
++++ b/pkg/fabricspark/operator_test.go
+@@ -0,0 +1,199 @@
++package fabricspark
++
++import (
++	"context"
++	"testing"
++
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// fakeClient records the statements the operator sends to the connection.
++type fakeClient struct {
++	queries     []string
++	pysparkRuns []string
++	schemas     []string
++}
++
++func (c *fakeClient) RunQueryWithoutResult(_ context.Context, q *query.Query) error {
++	c.queries = append(c.queries, q.Query)
++	return nil
++}
++
++func (c *fakeClient) Select(_ context.Context, _ *query.Query) ([][]interface{}, error) {
++	return nil, nil
++}
++
++func (c *fakeClient) SelectWithSchema(_ context.Context, _ *query.Query) (*query.QueryResult, error) {
++	return &query.QueryResult{}, nil
++}
++
++func (c *fakeClient) Ping(_ context.Context) error { return nil }
++
++func (c *fakeClient) CreateSchemaIfNotExist(_ context.Context, asset *pipeline.Asset, _ string) error {
++	c.schemas = append(c.schemas, asset.Name)
++	return nil
++}
++
++func (c *fakeClient) RunPySpark(_ context.Context, code string) (string, error) {
++	c.pysparkRuns = append(c.pysparkRuns, code)
++	return "3", nil
++}
++
++// fakeConnectionGetter implements config.ConnectionGetter.
++type fakeConnectionGetter struct {
++	connections map[string]any
++}
++
++func (f *fakeConnectionGetter) GetConnection(name string) any {
++	return f.connections[name]
++}
++
++// passthroughExtractor implements query.QueryExtractor without jinja.
++type passthroughExtractor struct {
++	reextractCalls int
++}
++
++func (e *passthroughExtractor) ExtractQueriesFromString(content string) ([]*query.Query, error) {
++	return []*query.Query{{Query: content}}, nil
++}
++
++func (e *passthroughExtractor) CloneForAsset(_ context.Context, _ *pipeline.Pipeline, _ *pipeline.Asset) (query.QueryExtractor, error) {
++	return e, nil
++}
++
++func (e *passthroughExtractor) ReextractQueriesFromSlice(content []string) ([]string, error) {
++	e.reextractCalls++
++	return content, nil
++}
++
++func TestBasicOperatorRunTask(t *testing.T) {
++	t.Parallel()
++
++	client := &fakeClient{}
++	conn := &fakeConnectionGetter{connections: map[string]any{"fabric-spark-default": client}}
++
++	operator := NewBasicOperator(conn, &passthroughExtractor{}, NewMaterializer(false))
++
++	asset := &pipeline.Asset{
++		Name:       "reporting.events",
++		Type:       pipeline.AssetTypeFabricSparkQuery,
++		Connection: "fabric-spark-default",
++		ExecutableFile: pipeline.ExecutableFile{
++			Content: "SELECT * FROM raw.events",
++		},
++		Materialization: pipeline.Materialization{
++			Type:     pipeline.MaterializationTypeTable,
++			Strategy: pipeline.MaterializationStrategyCreateReplace,
++		},
++	}
++	p := &pipeline.Pipeline{Name: "my-pipeline", Assets: []*pipeline.Asset{asset}}
++
++	err := operator.RunTask(context.Background(), p, asset)
++	require.NoError(t, err)
++
++	// Schema creation must have been attempted for the materialized asset.
++	assert.Equal(t, []string{"reporting.events"}, client.schemas)
++
++	require.Len(t, client.queries, 1)
++	assert.Contains(t, client.queries[0], "CREATE OR REPLACE TABLE reporting.events")
++}
++
++func TestBasicOperatorMissingConnection(t *testing.T) {
++	t.Parallel()
++
++	operator := NewBasicOperator(&fakeConnectionGetter{connections: map[string]any{}}, &passthroughExtractor{}, NewMaterializer(false))
++
++	asset := &pipeline.Asset{
++		Name:           "reporting.events",
++		Type:           pipeline.AssetTypeFabricSparkQuery,
++		Connection:     "missing",
++		ExecutableFile: pipeline.ExecutableFile{Content: "SELECT 1"},
++	}
++	p := &pipeline.Pipeline{Name: "my-pipeline", Assets: []*pipeline.Asset{asset}}
++
++	err := operator.RunTask(context.Background(), p, asset)
++	require.Error(t, err)
++}
++
++func TestBasicOperatorRejectsWrongConnectionType(t *testing.T) {
++	t.Parallel()
++
++	conn := &fakeConnectionGetter{connections: map[string]any{"other": "not a client"}}
++	operator := NewBasicOperator(conn, &passthroughExtractor{}, NewMaterializer(false))
++
++	asset := &pipeline.Asset{
++		Name:           "reporting.events",
++		Type:           pipeline.AssetTypeFabricSparkQuery,
++		Connection:     "other",
++		ExecutableFile: pipeline.ExecutableFile{Content: "SELECT 1"},
++	}
++	p := &pipeline.Pipeline{Name: "my-pipeline", Assets: []*pipeline.Asset{asset}}
++
++	err := operator.RunTask(context.Background(), p, asset)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "not a fabric spark connection")
++}
++
++func TestBasicOperatorAntiJoinRendersRunWindow(t *testing.T) {
++	t.Parallel()
++
++	client := &fakeClient{}
++	conn := &fakeConnectionGetter{connections: map[string]any{"fabric-spark-default": client}}
++	extractor := &passthroughExtractor{}
++	operator := NewBasicOperator(conn, extractor, NewMaterializer(false))
++
++	asset := &pipeline.Asset{
++		Name:       "reporting.orders",
++		Type:       pipeline.AssetTypeFabricSparkQuery,
++		Connection: "fabric-spark-default",
++		ExecutableFile: pipeline.ExecutableFile{
++			Content: "SELECT * FROM staging.orders",
++		},
++		Materialization: pipeline.Materialization{
++			Type:            pipeline.MaterializationTypeTable,
++			Strategy:        pipeline.MaterializationStrategyAntiJoin,
++			IncrementalKey:  "order_ts",
++			TimeGranularity: pipeline.MaterializationTimeGranularityTimestamp,
++		},
++		Columns: []pipeline.Column{
++			{Name: "source_system", PrimaryKey: true},
++			{Name: "order_number", PrimaryKey: true},
++		},
++	}
++	p := &pipeline.Pipeline{Name: "my-pipeline", Assets: []*pipeline.Asset{asset}}
++
++	require.NoError(t, operator.RunTask(context.Background(), p, asset))
++
++	// A window-bounded anti join must go through placeholder re-rendering.
++	assert.Equal(t, 1, extractor.reextractCalls)
++	require.Len(t, client.queries, 4)
++	assert.Contains(t, client.queries[2], "LEFT ANTI JOIN")
++	assert.Contains(t, client.queries[2], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
++}
++
++func TestPySparkOperatorRunTask(t *testing.T) {
++	t.Parallel()
++
++	client := &fakeClient{}
++	conn := &fakeConnectionGetter{connections: map[string]any{"fabric-spark-default": client}}
++	operator := NewPySparkOperator(conn)
++
++	asset := &pipeline.Asset{
++		Name:       "transform.enrich",
++		Type:       pipeline.AssetTypeFabricSparkPySpark,
++		Connection: "fabric-spark-default",
++		ExecutableFile: pipeline.ExecutableFile{
++			Content: "df = spark.range(3)\nprint(df.count())",
++		},
++	}
++	p := &pipeline.Pipeline{Name: "my-pipeline", Assets: []*pipeline.Asset{asset}}
++
++	err := operator.RunTask(context.Background(), p, asset)
++	require.NoError(t, err)
++
++	require.Len(t, client.pysparkRuns, 1)
++	assert.Contains(t, client.pysparkRuns[0], "spark.range(3)")
++}
+diff --git a/pkg/fabricspark/scd2_test.go b/pkg/fabricspark/scd2_test.go
+new file mode 100644
+index 0000000..9cfe364
+--- /dev/null
++++ b/pkg/fabricspark/scd2_test.go
+@@ -0,0 +1,129 @@
++package fabricspark
++
++import (
++	"testing"
++
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func scd2Asset(strategy pipeline.MaterializationStrategy, incrementalKey string) *pipeline.Asset {
++	return &pipeline.Asset{
++		Name: "dims.customers",
++		Materialization: pipeline.Materialization{
++			Type:           pipeline.MaterializationTypeTable,
++			Strategy:       strategy,
++			IncrementalKey: incrementalKey,
++		},
++		Columns: []pipeline.Column{
++			{Name: "customer_id", Type: "bigint", PrimaryKey: true},
++			{Name: "segment", Type: "string"},
++			{Name: "updated_at", Type: "timestamp"},
++		},
++	}
++}
++
++func TestSCD2ByColumnIncremental(t *testing.T) {
++	t.Parallel()
++
++	got, err := NewMaterializer(false).Render(scd2Asset(pipeline.MaterializationStrategySCD2ByColumn, ""), "SELECT * FROM src")
++	require.NoError(t, err)
++	require.Len(t, got, 1)
++
++	sql := got[0]
++	assert.Contains(t, sql, "MERGE INTO dims.customers AS target")
++	// Change detection compares every non-key column.
++	assert.Contains(t, sql, "target.segment != source.segment")
++	assert.Contains(t, sql, "target.updated_at != source.updated_at")
++	// Keys never appear in the change comparison.
++	assert.NotContains(t, sql, "target.customer_id != source.customer_id")
++	// Bookkeeping columns are written on insert.
++	assert.Contains(t, sql, "_valid_from, _valid_until, _is_current")
++	assert.Contains(t, sql, "TIMESTAMP '9999-12-31 00:00:00'")
++	// Vanished keys are closed out.
++	assert.Contains(t, sql, "WHEN NOT MATCHED BY SOURCE AND target._is_current = TRUE")
++	// Without an incremental key, validity uses the wall clock.
++	assert.Contains(t, sql, "CURRENT_TIMESTAMP()")
++}
++
++func TestSCD2ByColumnUsesIncrementalKeyWhenSet(t *testing.T) {
++	t.Parallel()
++
++	got, err := NewMaterializer(false).Render(scd2Asset(pipeline.MaterializationStrategySCD2ByColumn, "updated_at"), "SELECT * FROM src")
++	require.NoError(t, err)
++	assert.Contains(t, got[0], "source.updated_at, TIMESTAMP '9999-12-31 00:00:00', TRUE")
++}
++
++func TestSCD2ByTimeIncremental(t *testing.T) {
++	t.Parallel()
++
++	got, err := NewMaterializer(false).Render(scd2Asset(pipeline.MaterializationStrategySCD2ByTime, "updated_at"), "SELECT * FROM src")
++	require.NoError(t, err)
++	require.Len(t, got, 1)
++
++	sql := got[0]
++	assert.Contains(t, sql, "MERGE INTO dims.customers AS target")
++	// Row versioning is time-driven, not column-comparison-driven.
++	assert.Contains(t, sql, "target._valid_from < source.updated_at")
++	assert.Contains(t, sql, "t1._valid_from < s1.updated_at")
++	assert.Contains(t, sql, "WHEN NOT MATCHED BY SOURCE AND target._is_current = TRUE")
++	assert.NotContains(t, sql, "!=")
++}
++
++func TestSCD2ByTimeValidation(t *testing.T) {
++	t.Parallel()
++
++	// Missing incremental key.
++	_, err := NewMaterializer(false).Render(scd2Asset(pipeline.MaterializationStrategySCD2ByTime, ""), "SELECT 1")
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "incremental_key")
++
++	// Incremental key must be a time type.
++	asset := scd2Asset(pipeline.MaterializationStrategySCD2ByTime, "segment")
++	_, err = NewMaterializer(false).Render(asset, "SELECT 1")
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "TIMESTAMP or DATE")
++}
++
++func TestSCD2ReservedColumnsRejected(t *testing.T) {
++	t.Parallel()
++
++	asset := scd2Asset(pipeline.MaterializationStrategySCD2ByColumn, "")
++	asset.Columns = append(asset.Columns, pipeline.Column{Name: "_is_current", Type: "boolean"})
++
++	_, err := NewMaterializer(false).Render(asset, "SELECT 1")
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "reserved")
++}
++
++func TestSCD2RequiresPrimaryKey(t *testing.T) {
++	t.Parallel()
++
++	asset := scd2Asset(pipeline.MaterializationStrategySCD2ByColumn, "")
++	for i := range asset.Columns {
++		asset.Columns[i].PrimaryKey = false
++	}
++
++	_, err := NewMaterializer(false).Render(asset, "SELECT 1")
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "primary_key")
++}
++
++func TestSCD2FullRefreshKeepsBookkeepingColumns(t *testing.T) {
++	t.Parallel()
++
++	// --full-refresh flips to the create+replace path, which must still
++	// rebuild the SCD2 bookkeeping columns rather than a plain table.
++	for _, strategy := range []pipeline.MaterializationStrategy{
++		pipeline.MaterializationStrategySCD2ByColumn,
++		pipeline.MaterializationStrategySCD2ByTime,
++	} {
++		got, err := NewMaterializer(true).Render(scd2Asset(strategy, "updated_at"), "SELECT * FROM src")
++		require.NoError(t, err, strategy)
++		require.Len(t, got, 1, strategy)
++		assert.Contains(t, got[0], "CREATE OR REPLACE TABLE dims.customers", strategy)
++		assert.Contains(t, got[0], "AS _valid_from", strategy)
++		assert.Contains(t, got[0], "TRUE AS _is_current", strategy)
++	}
++}
+diff --git a/pkg/fabricspark/seed.go b/pkg/fabricspark/seed.go
+new file mode 100644
+index 0000000..301b29a
+--- /dev/null
++++ b/pkg/fabricspark/seed.go
+@@ -0,0 +1,192 @@
++package fabricspark
++
++import (
++	"context"
++	"encoding/csv"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/bruin-data/bruin/pkg/ansisql"
++	"github.com/bruin-data/bruin/pkg/config"
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/bruin-data/bruin/pkg/scheduler"
++	"github.com/pkg/errors"
++)
++
++// seedBatchSize bounds how many rows go into a single INSERT statement so
++// individual Livy statements stay well under Fabric's payload limits.
++const seedBatchSize = 500
++
++// SeedOperator loads a CSV file into a lakehouse Delta table for
++// `fabric.spark.seed` assets. Bruin's shared seed operator delegates to
++// ingestr, which has no Fabric Lakehouse Spark destination — so this
++// implementation loads the file natively through the Spark session:
++// CREATE OR REPLACE TABLE followed by batched INSERTs.
++//
++// Column types come from the asset's `columns` definitions when present
++// (values are CAST accordingly); undeclared columns default to STRING.
++type SeedOperator struct {
++	connection config.ConnectionGetter
++}
++
++// NewSeedOperator builds the seed operator.
++func NewSeedOperator(conn config.ConnectionGetter) *SeedOperator {
++	return &SeedOperator{connection: conn}
++}
++
++// Run implements scheduler execution for a task instance.
++func (o SeedOperator) Run(ctx context.Context, ti scheduler.TaskInstance) error {
++	return o.RunTask(ctx, ti.GetPipeline(), ti.GetAsset())
++}
++
++// RunTask loads the asset's CSV into its target table.
++func (o SeedOperator) RunTask(ctx context.Context, p *pipeline.Pipeline, t *pipeline.Asset) error {
++	seedPath, ok := t.Parameters.GetString("path")
++	if !ok || seedPath == "" {
++		return errors.New("seed assets require a `path` parameter pointing to the CSV file")
++	}
++	if !filepath.IsAbs(seedPath) {
++		seedPath = filepath.Join(filepath.Dir(t.ExecutableFile.Path), seedPath)
++	}
++
++	headers, rows, err := readSeedCSV(seedPath)
++	if err != nil {
++		return err
++	}
++
++	statements, err := buildSeedStatements(t, headers, rows)
++	if err != nil {
++		return err
++	}
++
++	connName, err := p.GetConnectionNameForAsset(t)
++	if err != nil {
++		return err
++	}
++	rawConn := o.connection.GetConnection(connName)
++	if rawConn == nil {
++		return config.NewConnectionNotFoundError(ctx, "", connName)
++	}
++	conn, ok := rawConn.(Client)
++	if !ok {
++		return errors.Errorf("connection '%s' is not a fabric spark connection", connName)
++	}
++
++	if err := conn.CreateSchemaIfNotExist(ctx, t, p.Name); err != nil {
++		return err
++	}
++
++	for _, statement := range statements {
++		q := &query.Query{Query: statement}
++		annotatedQuery, err := ansisql.AddAnnotationComment(ctx, q, t.Name, "main", p.Name)
++		if err != nil {
++			return err
++		}
++		if err := conn.RunQueryWithoutResult(ctx, annotatedQuery); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func readSeedCSV(path string) ([]string, [][]string, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return nil, nil, errors.Wrapf(err, "failed to open seed file %s", path)
++	}
++	defer f.Close()
++
++	reader := csv.NewReader(f)
++	reader.FieldsPerRecord = -1
++	records, err := reader.ReadAll()
++	if err != nil {
++		return nil, nil, errors.Wrapf(err, "failed to parse seed file %s", path)
++	}
++	if len(records) == 0 {
++		return nil, nil, errors.Errorf("seed file %s is empty, it must contain at least a header row", path)
++	}
++
++	headers := records[0]
++	for i, h := range headers {
++		headers[i] = strings.TrimSpace(h)
++	}
++	return headers, records[1:], nil
++}
++
++// buildSeedStatements produces a CREATE OR REPLACE TABLE plus batched INSERT
++// statements for the parsed CSV.
++func buildSeedStatements(t *pipeline.Asset, headers []string, rows [][]string) ([]string, error) {
++	if len(headers) == 0 {
++		return nil, errors.New("seed file has no columns")
++	}
++
++	types := make([]string, len(headers))
++	declared := make(map[string]string, len(t.Columns))
++	for _, col := range t.Columns {
++		declared[strings.ToLower(col.Name)] = col.Type
++	}
++	for i, h := range headers {
++		if declaredType, ok := declared[strings.ToLower(h)]; ok && declaredType != "" {
++			types[i] = declaredType
++		} else {
++			types[i] = "STRING"
++		}
++	}
++
++	columnDefs := make([]string, len(headers))
++	for i, h := range headers {
++		columnDefs[i] = fmt.Sprintf("%s %s", QuoteIdentifier(h), types[i])
++	}
++
++	statements := []string{
++		fmt.Sprintf("CREATE OR REPLACE TABLE %s (\n%s\n)", t.Name, strings.Join(columnDefs, ",\n")),
++	}
++
++	for start := 0; start < len(rows); start += seedBatchSize {
++		end := min(start+seedBatchSize, len(rows))
++
++		values := make([]string, 0, end-start)
++		for _, row := range rows[start:end] {
++			cells := make([]string, len(headers))
++			for i := range headers {
++				var cell string
++				if i < len(row) {
++					cell = row[i]
++				}
++				cells[i] = seedValueLiteral(cell, types[i])
++			}
++			values = append(values, "("+strings.Join(cells, ", ")+")")
++		}
++
++		statements = append(statements, fmt.Sprintf("INSERT INTO %s VALUES\n%s", t.Name, strings.Join(values, ",\n")))
++	}
++
++	return statements, nil
++}
++
++// seedValueLiteral renders one CSV cell as a Spark SQL literal, casting to
++// the column type when it isn't a string.
++func seedValueLiteral(value, sqlType string) string {
++	isString := isStringType(sqlType)
++	if value == "" && !isString {
++		return "NULL"
++	}
++
++	escaped := strings.ReplaceAll(value, `\`, `\\`)
++	escaped = strings.ReplaceAll(escaped, "'", `\'`)
++	literal := "'" + escaped + "'"
++
++	if isString {
++		return literal
++	}
++	return fmt.Sprintf("CAST(%s AS %s)", literal, strings.ToUpper(sqlType))
++}
++
++func isStringType(sqlType string) bool {
++	lc := strings.ToLower(sqlType)
++	return lc == "" || lc == "string" || strings.Contains(lc, "char") || strings.Contains(lc, "text")
++}
+diff --git a/pkg/fabricspark/seed_test.go b/pkg/fabricspark/seed_test.go
+new file mode 100644
+index 0000000..a1b0015
+--- /dev/null
++++ b/pkg/fabricspark/seed_test.go
+@@ -0,0 +1,110 @@
++package fabricspark
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestBuildSeedStatements(t *testing.T) {
++	t.Parallel()
++
++	asset := &pipeline.Asset{
++		Name: "raw.countries",
++		Columns: []pipeline.Column{
++			{Name: "code", Type: "string"},
++			{Name: "population", Type: "bigint"},
++		},
++	}
++
++	headers := []string{"code", "population", "note"}
++	rows := [][]string{
++		{"NL", "17000000", "it's flat"},
++		{"DE", "", "umlauts \\ backslash"},
++	}
++
++	statements, err := buildSeedStatements(asset, headers, rows)
++	require.NoError(t, err)
++	require.Len(t, statements, 2)
++
++	// Declared columns keep their types; undeclared default to STRING.
++	assert.Contains(t, statements[0], "CREATE OR REPLACE TABLE raw.countries")
++	assert.Contains(t, statements[0], "`code` string")
++	assert.Contains(t, statements[0], "`population` bigint")
++	assert.Contains(t, statements[0], "`note` STRING")
++
++	insert := statements[1]
++	// Typed columns are CAST; empty non-string cells become NULL.
++	assert.Contains(t, insert, "CAST('17000000' AS BIGINT)")
++	assert.Contains(t, insert, "NULL")
++	// Quotes and backslashes are escaped.
++	assert.Contains(t, insert, `'it\'s flat'`)
++	assert.Contains(t, insert, `'umlauts \\ backslash'`)
++}
++
++func TestBuildSeedStatementsBatches(t *testing.T) {
++	t.Parallel()
++
++	asset := &pipeline.Asset{Name: "raw.numbers"}
++	rows := make([][]string, seedBatchSize+1)
++	for i := range rows {
++		rows[i] = []string{"x"}
++	}
++
++	statements, err := buildSeedStatements(asset, []string{"value"}, rows)
++	require.NoError(t, err)
++	// 1 CREATE + 2 INSERT batches.
++	require.Len(t, statements, 3)
++	assert.Equal(t, seedBatchSize, strings.Count(statements[1], "('x')"))
++	assert.Equal(t, 1, strings.Count(statements[2], "('x')"))
++}
++
++func TestSeedOperatorRunTask(t *testing.T) {
++	t.Parallel()
++
++	dir := t.TempDir()
++	csvPath := filepath.Join(dir, "countries.csv")
++	require.NoError(t, os.WriteFile(csvPath, []byte("code,name\nNL,Netherlands\nDE,Germany\n"), 0o644))
++
++	client := &fakeClient{}
++	conn := &fakeConnectionGetter{connections: map[string]any{"fabric-spark-default": client}}
++	operator := NewSeedOperator(conn)
++
++	asset := &pipeline.Asset{
++		Name:       "raw.countries",
++		Type:       pipeline.AssetTypeFabricSparkSeed,
++		Connection: "fabric-spark-default",
++		ExecutableFile: pipeline.ExecutableFile{
++			Path: filepath.Join(dir, "countries.asset.yml"),
++		},
++		Parameters: pipeline.ParameterMap{"path": "countries.csv"},
++	}
++	p := &pipeline.Pipeline{Name: "my-pipeline", Assets: []*pipeline.Asset{asset}}
++
++	require.NoError(t, operator.RunTask(context.Background(), p, asset))
++
++	// Schema creation + CREATE OR REPLACE + one INSERT batch.
++	assert.Equal(t, []string{"raw.countries"}, client.schemas)
++	require.Len(t, client.queries, 2)
++	assert.Contains(t, client.queries[0], "CREATE OR REPLACE TABLE raw.countries")
++	assert.Contains(t, client.queries[1], "INSERT INTO raw.countries VALUES")
++	assert.Contains(t, client.queries[1], "('NL', 'Netherlands')")
++}
++
++func TestSeedOperatorMissingPath(t *testing.T) {
++	t.Parallel()
++
++	operator := NewSeedOperator(&fakeConnectionGetter{connections: map[string]any{}})
++	asset := &pipeline.Asset{Name: "raw.x", Type: pipeline.AssetTypeFabricSparkSeed}
++	p := &pipeline.Pipeline{Name: "p", Assets: []*pipeline.Asset{asset}}
++
++	err := operator.RunTask(context.Background(), p, asset)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "path")
++}
+diff --git a/pkg/fabricspark/sensor.go b/pkg/fabricspark/sensor.go
+new file mode 100644
+index 0000000..d008745
+--- /dev/null
++++ b/pkg/fabricspark/sensor.go
+@@ -0,0 +1,150 @@
++package fabricspark
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"strings"
++	"time"
++
++	"github.com/bruin-data/bruin/pkg/ansisql"
++	"github.com/bruin-data/bruin/pkg/config"
++	"github.com/bruin-data/bruin/pkg/executor"
++	"github.com/bruin-data/bruin/pkg/helpers"
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/bruin-data/bruin/pkg/scheduler"
++	"github.com/pkg/errors"
++)
++
++// NewQuerySensor builds the sensor for `fabric.spark.sensor.query` assets.
++// The generic ANSI SQL query sensor works as-is because it only needs the
++// connection's Select method, which *DB provides.
++func NewQuerySensor(conn config.ConnectionGetter, extractor query.QueryExtractor, sensorMode string) *ansisql.QuerySensor {
++	return ansisql.NewQuerySensor(conn, extractor, sensorMode)
++}
++
++// TableSensor waits until a table exists in the lakehouse, for
++// `fabric.spark.sensor.table` assets.
++//
++// This is a Spark-specific implementation rather than ansisql.TableSensor:
++// Fabric Spark lakehouses expose no information_schema to build a portable
++// COUNT(*) existence query against, and probing the table directly errors
++// (rather than returning zero) while the table doesn't exist yet. Instead the
++// sensor pokes `SHOW TABLES IN <schema> LIKE '<table>'` and counts the
++// returned rows client-side.
++type TableSensor struct {
++	connection config.ConnectionGetter
++	sensorMode string
++}
++
++// NewTableSensor builds the table sensor. sensorMode mirrors bruin's sensor
++// modes: "skip" (no-op), "once" or "" (single poke), anything else waits and
++// re-pokes until the sensor timeout.
++func NewTableSensor(conn config.ConnectionGetter, sensorMode string) *TableSensor {
++	return &TableSensor{connection: conn, sensorMode: sensorMode}
++}
++
++// Run implements scheduler execution for a task instance.
++func (ts *TableSensor) Run(ctx context.Context, ti scheduler.TaskInstance) error {
++	return ts.RunTask(ctx, ti.GetPipeline(), ti.GetAsset())
++}
++
++// RunTask pokes for the table until it exists or the sensor times out.
++func (ts *TableSensor) RunTask(ctx context.Context, p *pipeline.Pipeline, t *pipeline.Asset) error {
++	if ts.sensorMode == "skip" {
++		return nil
++	}
++
++	tableName, ok := t.Parameters.GetString("table")
++	if !ok || tableName == "" {
++		return errors.New("table sensor requires a parameter named 'table'")
++	}
++
++	showQuery, err := BuildTableExistsShowQuery(tableName)
++	if err != nil {
++		return err
++	}
++
++	connName, err := p.GetConnectionNameForAsset(t)
++	if err != nil {
++		return err
++	}
++	rawConn := ts.connection.GetConnection(connName)
++	if rawConn == nil {
++		return config.NewConnectionNotFoundError(ctx, "", connName)
++	}
++	conn, ok := rawConn.(Client)
++	if !ok {
++		return errors.Errorf("connection '%s' is not a fabric spark connection", connName)
++	}
++
++	printer, printerExists := ctx.Value(executor.KeyPrinter).(io.Writer)
++	if printerExists {
++		fmt.Fprintln(printer, "Poking:", tableName)
++	}
++
++	sensorTimeout := helpers.GetSensorTimeout(t)
++	timeout := time.After(sensorTimeout)
++	for {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-timeout:
++			if printerExists {
++				fmt.Fprintln(printer, "Sensor timed out after", sensorTimeout)
++			}
++			return errors.Errorf("Sensor timed out after %s", sensorTimeout)
++		default:
++			res, err := conn.Select(ctx, &query.Query{Query: showQuery})
++			if err != nil {
++				if printerExists {
++					fmt.Fprintln(printer, "Error: Sensor query failed:", err)
++				}
++				return err
++			}
++
++			if len(res) > 0 {
++				return nil
++			}
++
++			if ts.sensorMode == "once" || ts.sensorMode == "" {
++				return errors.New("Sensor didn't return the expected result")
++			}
++
++			pokeInterval := helpers.GetPokeInterval(ctx, t)
++			if printerExists {
++				fmt.Fprintln(printer, "Info: table not found yet, waiting for", pokeInterval, "seconds")
++			}
++			select {
++			case <-ctx.Done():
++				return ctx.Err()
++			case <-time.After(time.Duration(pokeInterval) * time.Second):
++			}
++		}
++	}
++}
++
++// BuildTableExistsShowQuery renders the SHOW TABLES query used to probe for a
++// table. Accepts `table` or `schema.table` names.
++func BuildTableExistsShowQuery(tableName string) (string, error) {
++	parts := strings.Split(tableName, ".")
++	for _, part := range parts {
++		if strings.TrimSpace(part) == "" {
++			return "", errors.Errorf("invalid table name %q", tableName)
++		}
++	}
++
++	switch len(parts) {
++	case 1:
++		return fmt.Sprintf("SHOW TABLES LIKE '%s'", escapeSingleQuotes(parts[0])), nil
++	case 2:
++		return fmt.Sprintf("SHOW TABLES IN %s LIKE '%s'", QuoteIdentifier(parts[0]), escapeSingleQuotes(parts[1])), nil
++	default:
++		return "", errors.Errorf("table sensor supports `table` or `schema.table` names, got %q", tableName)
++	}
++}
++
++func escapeSingleQuotes(s string) string {
++	return strings.ReplaceAll(s, "'", `\'`)
++}
+diff --git a/pkg/fabricspark/sensor_test.go b/pkg/fabricspark/sensor_test.go
+new file mode 100644
+index 0000000..3a3c141
+--- /dev/null
++++ b/pkg/fabricspark/sensor_test.go
+@@ -0,0 +1,99 @@
++package fabricspark
++
++import (
++	"context"
++	"testing"
++
++	"github.com/bruin-data/bruin/pkg/pipeline"
++	"github.com/bruin-data/bruin/pkg/query"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestBuildTableExistsShowQuery(t *testing.T) {
++	t.Parallel()
++
++	q, err := BuildTableExistsShowQuery("events")
++	require.NoError(t, err)
++	assert.Equal(t, "SHOW TABLES LIKE 'events'", q)
++
++	q, err = BuildTableExistsShowQuery("reporting.events")
++	require.NoError(t, err)
++	assert.Equal(t, "SHOW TABLES IN `reporting` LIKE 'events'", q)
++
++	_, err = BuildTableExistsShowQuery("a.b.c")
++	require.Error(t, err)
++
++	_, err = BuildTableExistsShowQuery("reporting.")
++	require.Error(t, err)
++}
++
++// selectFakeClient extends fakeClient with canned Select results.
++type selectFakeClient struct {
++	fakeClient
++	selectResults [][]interface{}
++	selectQueries []string
++}
++
++func (c *selectFakeClient) Select(_ context.Context, q *query.Query) ([][]interface{}, error) {
++	c.selectQueries = append(c.selectQueries, q.Query)
++	return c.selectResults, nil
++}
++
++func tableSensorAsset() (*pipeline.Pipeline, *pipeline.Asset) {
++	asset := &pipeline.Asset{
++		Name:       "wait_for_events",
++		Type:       pipeline.AssetTypeFabricSparkTableSensor,
++		Connection: "fabric-spark-default",
++		Parameters: pipeline.ParameterMap{"table": "reporting.events"},
++	}
++	p := &pipeline.Pipeline{Name: "p", Assets: []*pipeline.Asset{asset}}
++	return p, asset
++}
++
++func TestTableSensorTableExists(t *testing.T) {
++	t.Parallel()
++
++	client := &selectFakeClient{selectResults: [][]interface{}{{"reporting", "events", false}}}
++	conn := &fakeConnectionGetter{connections: map[string]any{"fabric-spark-default": client}}
++	sensor := NewTableSensor(conn, "once")
++
++	p, asset := tableSensorAsset()
++	require.NoError(t, sensor.RunTask(context.Background(), p, asset))
++
++	require.Len(t, client.selectQueries, 1)
++	assert.Equal(t, "SHOW TABLES IN `reporting` LIKE 'events'", client.selectQueries[0])
++}
++
++func TestTableSensorTableMissingOnceMode(t *testing.T) {
++	t.Parallel()
++
++	client := &selectFakeClient{selectResults: [][]interface{}{}}
++	conn := &fakeConnectionGetter{connections: map[string]any{"fabric-spark-default": client}}
++	sensor := NewTableSensor(conn, "once")
++
++	p, asset := tableSensorAsset()
++	err := sensor.RunTask(context.Background(), p, asset)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "expected result")
++}
++
++func TestTableSensorSkipMode(t *testing.T) {
++	t.Parallel()
++
++	sensor := NewTableSensor(&fakeConnectionGetter{connections: map[string]any{}}, "skip")
++	p, asset := tableSensorAsset()
++	require.NoError(t, sensor.RunTask(context.Background(), p, asset))
++}
++
++func TestTableSensorMissingParameter(t *testing.T) {
++	t.Parallel()
++
++	sensor := NewTableSensor(&fakeConnectionGetter{connections: map[string]any{}}, "once")
++	asset := &pipeline.Asset{Name: "x", Type: pipeline.AssetTypeFabricSparkTableSensor}
++	p := &pipeline.Pipeline{Name: "p", Assets: []*pipeline.Asset{asset}}
++
++	err := sensor.RunTask(context.Background(), p, asset)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "table")
++}
+diff --git a/pkg/fabricspark/token.go b/pkg/fabricspark/token.go
+new file mode 100644
+index 0000000..d8a82ec
+--- /dev/null
++++ b/pkg/fabricspark/token.go
+@@ -0,0 +1,137 @@
++package fabricspark
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/pkg/errors"
++)
++
++// TokenProvider yields bearer tokens for the Fabric REST API.
++type TokenProvider interface {
++	Token(ctx context.Context) (string, error)
++}
++
++// staticTokenProvider returns a user-supplied token as-is.
++type staticTokenProvider struct {
++	token string
++}
++
++func (p *staticTokenProvider) Token(_ context.Context) (string, error) {
++	return p.token, nil
++}
++
++// servicePrincipalTokenProvider implements the Azure AD client-credentials
++// flow and caches the token until shortly before expiry.
++type servicePrincipalTokenProvider struct {
++	tenantID     string
++	clientID     string
++	clientSecret string
++	scope        string
++
++	// authorityBase is the AAD authority, overridable in tests.
++	authorityBase string
++	httpClient    *http.Client
++
++	mu        sync.Mutex
++	token     string
++	expiresAt time.Time
++}
++
++const tokenExpiryMargin = 5 * time.Minute
++
++// NewTokenProvider builds the right provider for the given config: a static
++// provider when an access token is configured, otherwise a service-principal
++// provider.
++func NewTokenProvider(c *Config) (TokenProvider, error) {
++	if c.AccessToken != "" {
++		return &staticTokenProvider{token: c.AccessToken}, nil
++	}
++
++	if c.TenantID == "" || c.ClientID == "" || c.ClientSecret == "" {
++		return nil, errors.New("service principal authentication requires `tenant_id`, `client_id` and `client_secret`")
++	}
++
++	scope := c.Scope
++	if scope == "" {
++		scope = DefaultScope
++	}
++
++	return &servicePrincipalTokenProvider{
++		tenantID:      c.TenantID,
++		clientID:      c.ClientID,
++		clientSecret:  c.ClientSecret,
++		scope:         scope,
++		authorityBase: "https://login.microsoftonline.com",
++		httpClient:    &http.Client{Timeout: 30 * time.Second},
++	}, nil
++}
++
++func (p *servicePrincipalTokenProvider) Token(ctx context.Context) (string, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	if p.token != "" && time.Now().Before(p.expiresAt.Add(-tokenExpiryMargin)) {
++		return p.token, nil
++	}
++
++	form := url.Values{}
++	form.Set("grant_type", "client_credentials")
++	form.Set("client_id", p.clientID)
++	form.Set("client_secret", p.clientSecret)
++	form.Set("scope", p.scope)
++
++	tokenURL := fmt.Sprintf("%s/%s/oauth2/v2.0/token", strings.TrimSuffix(p.authorityBase, "/"), p.tenantID)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
++	if err != nil {
++		return "", errors.Wrap(err, "failed to build Azure AD token request")
++	}
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++
++	resp, err := p.httpClient.Do(req)
++	if err != nil {
++		return "", errors.Wrap(err, "failed to reach Azure AD token endpoint")
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return "", errors.Wrap(err, "failed to read Azure AD token response")
++	}
++
++	if resp.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("azure AD token request failed (HTTP %d): %s", resp.StatusCode, summarizeBody(body))
++	}
++
++	var parsed struct {
++		AccessToken string `json:"access_token"`
++		ExpiresIn   int64  `json:"expires_in"`
++	}
++	if err := json.Unmarshal(body, &parsed); err != nil {
++		return "", errors.Wrap(err, "failed to decode Azure AD token response")
++	}
++	if parsed.AccessToken == "" {
++		return "", errors.New("azure AD token response did not contain an access token")
++	}
++
++	p.token = parsed.AccessToken
++	p.expiresAt = time.Now().Add(time.Duration(parsed.ExpiresIn) * time.Second)
++
++	return p.token, nil
++}
++
++// summarizeBody trims an HTTP error body so failures stay readable in logs.
++func summarizeBody(body []byte) string {
++	s := strings.TrimSpace(string(body))
++	if len(s) > 512 {
++		return s[:512] + "..."
++	}
++	return s
++}
+diff --git a/pkg/fabricspark/token_test.go b/pkg/fabricspark/token_test.go
+new file mode 100644
+index 0000000..b4d94a5
+--- /dev/null
++++ b/pkg/fabricspark/token_test.go
+@@ -0,0 +1,103 @@
++package fabricspark
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestStaticTokenProvider(t *testing.T) {
++	t.Parallel()
++
++	provider, err := NewTokenProvider(&Config{AccessToken: "static-token"})
++	require.NoError(t, err)
++
++	token, err := provider.Token(context.Background())
++	require.NoError(t, err)
++	assert.Equal(t, "static-token", token)
++}
++
++func TestServicePrincipalTokenProviderRequiresFields(t *testing.T) {
++	t.Parallel()
++
++	_, err := NewTokenProvider(&Config{TenantID: "t", ClientID: "c"})
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "client_secret")
++}
++
++func TestServicePrincipalTokenProviderFetchesAndCaches(t *testing.T) {
++	t.Parallel()
++
++	var calls atomic.Int64
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		calls.Add(1)
++
++		require.NoError(t, r.ParseForm())
++		assert.Equal(t, "/my-tenant/oauth2/v2.0/token", r.URL.Path)
++		assert.Equal(t, "client_credentials", r.Form.Get("grant_type"))
++		assert.Equal(t, "my-client", r.Form.Get("client_id"))
++		assert.Equal(t, "my-secret", r.Form.Get("client_secret"))
++		assert.Equal(t, DefaultScope, r.Form.Get("scope"))
++
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"access_token": "issued-token",
++			"expires_in":   3600,
++		})
++	}))
++	defer server.Close()
++
++	provider := &servicePrincipalTokenProvider{
++		tenantID:      "my-tenant",
++		clientID:      "my-client",
++		clientSecret:  "my-secret",
++		scope:         DefaultScope,
++		authorityBase: server.URL,
++		httpClient:    server.Client(),
++	}
++
++	token, err := provider.Token(context.Background())
++	require.NoError(t, err)
++	assert.Equal(t, "issued-token", token)
++
++	// The second call must be served from cache.
++	token, err = provider.Token(context.Background())
++	require.NoError(t, err)
++	assert.Equal(t, "issued-token", token)
++	assert.Equal(t, int64(1), calls.Load())
++
++	// Force expiry and confirm a refresh happens.
++	provider.expiresAt = time.Now().Add(-time.Minute)
++	_, err = provider.Token(context.Background())
++	require.NoError(t, err)
++	assert.Equal(t, int64(2), calls.Load())
++}
++
++func TestServicePrincipalTokenProviderSurfacesErrors(t *testing.T) {
++	t.Parallel()
++
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusUnauthorized)
++		_, _ = w.Write([]byte(`{"error":"invalid_client"}`))
++	}))
++	defer server.Close()
++
++	provider := &servicePrincipalTokenProvider{
++		tenantID:      "my-tenant",
++		clientID:      "my-client",
++		clientSecret:  "bad-secret",
++		scope:         DefaultScope,
++		authorityBase: server.URL,
++		httpClient:    server.Client(),
++	}
++
++	_, err := provider.Token(context.Background())
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "invalid_client")
++}
+diff --git a/pkg/jinja/bruin_funcs.go b/pkg/jinja/bruin_funcs.go
+index 2b0dd88..6228b9e 100644
+--- a/pkg/jinja/bruin_funcs.go
++++ b/pkg/jinja/bruin_funcs.go
+@@ -26,15 +26,17 @@ const (
+ 	PlatformDoris      Platform = "doris"
+ 	PlatformDuckDB     Platform = "duckdb"
+ 	PlatformDatabricks Platform = "databricks"
+-	PlatformMSSQL      Platform = "mssql"
+-	PlatformClickhouse Platform = "clickhouse"
+-	PlatformAthena     Platform = "athena"
+-	PlatformTrino      Platform = "trino"
+-	PlatformSynapse    Platform = "synapse"
+-	PlatformOracle     Platform = "oracle"
+-	PlatformFabric     Platform = "fabric"
+-	PlatformVertica    Platform = "vertica"
+-	PlatformStarRocks  Platform = "starrocks"
++	// PlatformFabricSpark is Microsoft Fabric Lakehouse Spark (Spark SQL dialect).
++	PlatformFabricSpark Platform = "fabric-spark"
++	PlatformMSSQL       Platform = "mssql"
++	PlatformClickhouse  Platform = "clickhouse"
++	PlatformAthena      Platform = "athena"
++	PlatformTrino       Platform = "trino"
++	PlatformSynapse     Platform = "synapse"
++	PlatformOracle      Platform = "oracle"
++	PlatformFabric      Platform = "fabric"
++	PlatformVertica     Platform = "vertica"
++	PlatformStarRocks   Platform = "starrocks"
+ )
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/pkg/jinja/jinja.go b/pkg/jinja/jinja.go
+index e387418..0e21392 100644
+--- a/pkg/jinja/jinja.go
++++ b/pkg/jinja/jinja.go
+@@ -385,11 +385,15 @@ var assetTypePlatform = map[pipeline.AssetType]Platform{
+ 	pipeline.AssetTypeDuckDBSource:      PlatformDuckDB,
+ 	pipeline.AssetTypeMotherduckQuery:   PlatformDuckDB,
+ 
+-	pipeline.AssetTypeDatabricksQuery:       PlatformDatabricks,
+-	pipeline.AssetTypeDatabricksSeed:        PlatformDatabricks,
+-	pipeline.AssetTypeDatabricksQuerySensor: PlatformDatabricks,
+-	pipeline.AssetTypeDatabricksSource:      PlatformDatabricks,
+-	pipeline.AssetTypeDatabricksTableSensor: PlatformDatabricks,
++	pipeline.AssetTypeDatabricksQuery:        PlatformDatabricks,
++	pipeline.AssetTypeDatabricksSeed:         PlatformDatabricks,
++	pipeline.AssetTypeDatabricksQuerySensor:  PlatformDatabricks,
++	pipeline.AssetTypeDatabricksSource:       PlatformDatabricks,
++	pipeline.AssetTypeDatabricksTableSensor:  PlatformDatabricks,
++	pipeline.AssetTypeFabricSparkQuery:       PlatformFabricSpark,
++	pipeline.AssetTypeFabricSparkSeed:        PlatformFabricSpark,
++	pipeline.AssetTypeFabricSparkQuerySensor: PlatformFabricSpark,
++	pipeline.AssetTypeFabricSparkTableSensor: PlatformFabricSpark,
+ 
+ 	pipeline.AssetTypeMsSQLQuery:       PlatformMSSQL,
+ 	pipeline.AssetTypeMsSQLSeed:        PlatformMSSQL,
+diff --git a/pkg/lint/rules.go b/pkg/lint/rules.go
+index fea9c03..be313b7 100644
+--- a/pkg/lint/rules.go
++++ b/pkg/lint/rules.go
+@@ -1489,6 +1489,20 @@ func EnsureMaterializationValuesAreValidForSingleAsset(ctx context.Context, p *p
+ 				})
+ 			}
+ 
++		case pipeline.MaterializationStrategyAntiJoin:
++			primaryKeys := asset.ColumnNamesWithPrimaryKey()
++			if len(primaryKeys) == 0 {
++				issues = append(issues, &Issue{
++					Task:        asset,
++					Description: "Materialization strategy 'anti_join' requires the 'primary_key' field to be set on at least one column, forming the business key for the anti join",
++				})
++			}
++			if asset.Materialization.IncrementalKey != "" && asset.Materialization.TimeGranularity == "" {
++				issues = append(issues, &Issue{
++					Task:        asset,
++					Description: "Materialization strategy 'anti_join' requires 'time_granularity' ('date' or 'timestamp') when 'incremental_key' is set",
++				})
++			}
+ 		case pipeline.MaterializationStrategyDataVaultHub:
+ 			issues = append(issues, ensureDataVaultHubColumnsAreValid(asset)...)
+ 		case pipeline.MaterializationStrategyDataVaultLink:
+@@ -1741,33 +1755,35 @@ func EnsureSnowflakeSensorHasQueryParameterForASingleAsset(ctx context.Context,
+ }
+ 
+ var TableSensorAllowedAssetTypes = map[pipeline.AssetType]bool{
+-	pipeline.AssetTypeBigqueryTableSensor:   true,
+-	pipeline.AssetTypeSnowflakeTableSensor:  true,
+-	pipeline.AssetTypeAthenaTableSensor:     true,
+-	pipeline.AssetTypeRedshiftTableSensor:   true,
+-	pipeline.AssetTypeDatabricksTableSensor: true,
+-	pipeline.AssetTypeClickHouseTableSensor: true,
+-	pipeline.AssetTypeMsSQLTableSensor:      true,
+-	pipeline.AssetTypePostgresTableSensor:   true,
+-	pipeline.AssetTypeSynapseTableSensor:    true,
+-	pipeline.AssetTypeMySQLTableSensor:      true,
+-	pipeline.AssetTypeDorisTableSensor:      true,
+-	pipeline.AssetTypeStarRocksTableSensor:  true,
++	pipeline.AssetTypeBigqueryTableSensor:    true,
++	pipeline.AssetTypeSnowflakeTableSensor:   true,
++	pipeline.AssetTypeAthenaTableSensor:      true,
++	pipeline.AssetTypeRedshiftTableSensor:    true,
++	pipeline.AssetTypeDatabricksTableSensor:  true,
++	pipeline.AssetTypeFabricSparkTableSensor: true,
++	pipeline.AssetTypeClickHouseTableSensor:  true,
++	pipeline.AssetTypeMsSQLTableSensor:       true,
++	pipeline.AssetTypePostgresTableSensor:    true,
++	pipeline.AssetTypeSynapseTableSensor:     true,
++	pipeline.AssetTypeMySQLTableSensor:       true,
++	pipeline.AssetTypeDorisTableSensor:       true,
++	pipeline.AssetTypeStarRocksTableSensor:   true,
+ }
+ 
+ var platformNames = map[pipeline.AssetType]string{
+-	pipeline.AssetTypeBigqueryTableSensor:   "BigQuery",
+-	pipeline.AssetTypeSnowflakeTableSensor:  "Snowflake",
+-	pipeline.AssetTypeDatabricksTableSensor: "Databricks",
+-	pipeline.AssetTypeAthenaTableSensor:     "Athena",
+-	pipeline.AssetTypePostgresTableSensor:   "PostgreSQL",
+-	pipeline.AssetTypeRedshiftTableSensor:   "Redshift",
+-	pipeline.AssetTypeMsSQLTableSensor:      "MS SQL",
+-	pipeline.AssetTypeClickHouseTableSensor: "ClickHouse",
+-	pipeline.AssetTypeSynapseTableSensor:    "Synapse",
+-	pipeline.AssetTypeMySQLTableSensor:      "MySQL",
+-	pipeline.AssetTypeDorisTableSensor:      "Doris",
+-	pipeline.AssetTypeStarRocksTableSensor:  "StarRocks",
++	pipeline.AssetTypeBigqueryTableSensor:    "BigQuery",
++	pipeline.AssetTypeSnowflakeTableSensor:   "Snowflake",
++	pipeline.AssetTypeDatabricksTableSensor:  "Databricks",
++	pipeline.AssetTypeFabricSparkTableSensor: "Fabric Spark",
++	pipeline.AssetTypeAthenaTableSensor:      "Athena",
++	pipeline.AssetTypePostgresTableSensor:    "PostgreSQL",
++	pipeline.AssetTypeRedshiftTableSensor:    "Redshift",
++	pipeline.AssetTypeMsSQLTableSensor:       "MS SQL",
++	pipeline.AssetTypeClickHouseTableSensor:  "ClickHouse",
++	pipeline.AssetTypeSynapseTableSensor:     "Synapse",
++	pipeline.AssetTypeMySQLTableSensor:       "MySQL",
++	pipeline.AssetTypeDorisTableSensor:       "Doris",
++	pipeline.AssetTypeStarRocksTableSensor:   "StarRocks",
+ }
+ 
+ func ValidateTableSensorTableParameter(ctx context.Context, p *pipeline.Pipeline, asset *pipeline.Asset) ([]*Issue, error) {
+diff --git a/pkg/pipeline/pipeline.go b/pkg/pipeline/pipeline.go
+index a0c9ab1..e93de8b 100644
+--- a/pkg/pipeline/pipeline.go
++++ b/pkg/pipeline/pipeline.go
+@@ -53,6 +53,11 @@ const (
+ 	AssetTypeDatabricksSeed            = AssetType("databricks.seed")
+ 	AssetTypeDatabricksSource          = AssetType("databricks.source")
+ 	AssetTypeDatabricksTableSensor     = AssetType("databricks.sensor.table")
++	AssetTypeFabricSparkQuery          = AssetType("fabric.spark.sql")
++	AssetTypeFabricSparkPySpark        = AssetType("fabric.spark.pyspark")
++	AssetTypeFabricSparkSeed           = AssetType("fabric.spark.seed")
++	AssetTypeFabricSparkQuerySensor    = AssetType("fabric.spark.sensor.query")
++	AssetTypeFabricSparkTableSensor    = AssetType("fabric.spark.sensor.table")
+ 	AssetTypeDataprocServerlessPyspark = AssetType("dataproc_serverless.pyspark")
+ 	AssetTypeDomo                      = AssetType("domo")
+ 	AssetTypeDorisQuery                = AssetType("doris.sql")
+@@ -172,6 +177,7 @@ var defaultMapping = map[string]string{
+ 	"redshift":              "redshift-default",
+ 	"mssql":                 "mssql-default",
+ 	"databricks":            "databricks-default",
++	"fabric_spark":          "fabric_spark-default",
+ 	"synapse":               "synapse-default",
+ 	"fabric":                "fabric-default",
+ 	"mongo":                 "mongo-default",
+@@ -612,6 +618,12 @@ const (
+ 	MaterializationStrategyDataVaultHub       MaterializationStrategy        = "datavault_hub"
+ 	MaterializationStrategyDataVaultLink      MaterializationStrategy        = "datavault_link"
+ 	MaterializationStrategyDataVaultSatellite MaterializationStrategy        = "datavault_satellite"
++	// MaterializationStrategyAntiJoin appends only rows whose (possibly
++	// compound) business key — the asset's primary_key columns — does not
++	// already exist in the target, via a null-safe LEFT ANTI JOIN. Unlike
++	// merge it never updates existing rows. Currently implemented by the
++	// Fabric Spark platform.
++	MaterializationStrategyAntiJoin MaterializationStrategy = "anti_join"
+ )
+ 
+ var AllAvailableMaterializationStrategies = []MaterializationStrategy{
+@@ -627,6 +639,7 @@ var AllAvailableMaterializationStrategies = []MaterializationStrategy{
+ 	MaterializationStrategyDataVaultHub,
+ 	MaterializationStrategyDataVaultLink,
+ 	MaterializationStrategyDataVaultSatellite,
++	MaterializationStrategyAntiJoin,
+ }
+ 
+ type Materialization struct {
+@@ -940,6 +953,11 @@ var AssetTypeConnectionMapping = map[AssetType]string{
+ 	AssetTypeDatabricksQuerySensor:     "databricks",
+ 	AssetTypeDatabricksSource:          "databricks",
+ 	AssetTypeDatabricksTableSensor:     "databricks",
++	AssetTypeFabricSparkQuery:          "fabric_spark",
++	AssetTypeFabricSparkPySpark:        "fabric_spark",
++	AssetTypeFabricSparkSeed:           "fabric_spark",
++	AssetTypeFabricSparkQuerySensor:    "fabric_spark",
++	AssetTypeFabricSparkTableSensor:    "fabric_spark",
+ 	AssetTypeSynapseQuery:              "synapse",
+ 	AssetTypeSynapseSeed:               "synapse",
+ 	AssetTypeSynapseQuerySensor:        "synapse",
+@@ -1014,6 +1032,7 @@ var IngestrTypeConnectionMapping = map[string]AssetType{
+ 	"redshift":      AssetTypeRedshiftQuery,
+ 	"mssql":         AssetTypeMsSQLQuery,
+ 	"databricks":    AssetTypeDatabricksQuery,
++	"fabric_spark":  AssetTypeFabricSparkQuery,
+ 	"synapse":       AssetTypeSynapseQuery,
+ 	"duckdb":        AssetTypeDuckDBQuery,
+ 	"clickhouse":    AssetTypeClickHouse,
+@@ -2514,6 +2533,7 @@ func (p *Pipeline) GetMajorityAssetTypesFromSQLAssets(defaultIfNone AssetType) A
+ 		AssetTypeMsSQLQuery:        0,
+ 		AssetTypeVerticaQuery:      0,
+ 		AssetTypeDatabricksQuery:   0,
++		AssetTypeFabricSparkQuery:  0,
+ 		AssetTypeRedshiftQuery:     0,
+ 		AssetTypeSynapseQuery:      0,
+ 		AssetTypeFabricQuery:       0,
+@@ -3992,6 +4012,7 @@ func IsSQLAssetType(t AssetType) bool {
+ 		AssetTypeMsSQLQuery,
+ 		AssetTypeVerticaQuery,
+ 		AssetTypeDatabricksQuery,
++		AssetTypeFabricSparkQuery,
+ 		AssetTypeSynapseQuery,
+ 		AssetTypeFabricQuery,
+ 		AssetTypeFabricQueryLegacy,
+diff --git a/pkg/sqlparser/parser.go b/pkg/sqlparser/parser.go
+index cc0f726..c16a2d1 100644
+--- a/pkg/sqlparser/parser.go
++++ b/pkg/sqlparser/parser.go
+@@ -354,6 +354,7 @@ var assetTypeDialectMap = map[pipeline.AssetType]string{
+ 	pipeline.AssetTypeSailQuery:         "trino",
+ 	pipeline.AssetTypeClickHouse:        "clickhouse",
+ 	pipeline.AssetTypeDatabricksQuery:   "databricks",
++	pipeline.AssetTypeFabricSparkQuery:  "spark",
+ 	pipeline.AssetTypeMsSQLQuery:        "tsql",
+ 	pipeline.AssetTypeSynapseQuery:      "tsql",
+ 	pipeline.AssetTypeDuckDBQuery:       "duckdb",
+@@ -392,6 +393,7 @@ var connectionTypeDialectMap = map[string]string{
+ 	"sail":                  "trino",
+ 	"clickhouse":            "clickhouse",
+ 	"databricks":            "databricks",
++	"fabric_spark":          "spark",
+ 	"mssql":                 "tsql",
+ 	"synapse":               "tsql",
+ 	"duckdb":                "duckdb",
+-- 
+2.43.0
+
