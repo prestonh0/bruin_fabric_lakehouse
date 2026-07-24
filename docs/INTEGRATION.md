@@ -160,7 +160,19 @@ Note: `pipeline.HookWrapperMaterializerList` expects the list-returning
 `fabricspark.NewMaterializer(fullRefresh)` directly — `BasicOperator` accepts
 anything satisfying the same interface.
 
-## 7. Optional niceties
+## 7. The `anti_join` strategy and lint
+
+The connector defines a custom materialization strategy,
+`fabricspark.MaterializationStrategyAntiJoin` (`"anti_join"`). Strategy names
+are only validated by the lint rule that checks against
+`pipeline.AllAvailableMaterializationStrategies` — execution does not gate on
+the list — so at runtime the strategy works as-is. For `bruin validate` to
+accept it upstream, add the constant to `pkg/pipeline/pipeline.go` next to
+the other `MaterializationStrategy*` constants and append it to
+`AllAvailableMaterializationStrategies` (or to a per-platform allowlist if
+one exists by then, since only Fabric Spark implements it).
+
+## 8. Optional niceties
 
 - `pkg/lint`: add both asset types to the valid-type and connection-exists
   rules (most of this falls out of the `AssetTypeConnectionMapping` entry).

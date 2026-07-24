@@ -163,8 +163,75 @@ pipeline.
 | `delete+insert` | ✅ | Temp view + `DELETE` + `INSERT` |
 | `truncate+insert` | ✅ | `DELETE FROM` + `INSERT` (works on every Delta table) |
 | `time_interval` | ✅ | Windowed `DELETE` + `INSERT` with `{{start_date}}`/`{{end_date}}` |
+| `anti_join` | ✅ | Connector-specific: insert-only incremental via null-safe `LEFT ANTI JOIN` on the compound business key (`primary_key` columns); optionally window-bounded |
 | `ddl` | ✅ | `CREATE TABLE IF NOT EXISTS` (no `PRIMARY KEY` constraint — Spark SQL doesn't have one) |
 | `scd2_by_column` / `scd2_by_time` | ⚠️ | Full-refresh rebuild only (`--full-refresh`); incremental SCD2 not implemented yet |
+
+## Incremental patterns
+
+Two incremental styles are supported, and they can be combined:
+
+**1. Datetime-window incrementals (`time_interval`)** — classic
+window-replace: delete the run's window from the target, insert the fresh
+rows. Bruin renders `{{start_date}}`/`{{end_date}}` (or the `_timestamp`
+variants) from the run's `--start-date`/`--end-date`:
+
+```yaml
+materialization:
+  type: table
+  strategy: time_interval
+  incremental_key: event_date
+  time_granularity: date
+```
+
+**2. Business-key incrementals (`anti_join`)** — insert-only: append the
+rows from the query whose **compound business key** does not already exist
+in the target. The key is whatever columns are marked `primary_key`, joined
+null-safely (`<=>`), so multi-column keys and NULL-bearing keys both dedupe
+correctly. Unlike `merge`, existing rows are never touched — a pure,
+idempotent, re-runnable append:
+
+```yaml
+materialization:
+  type: table
+  strategy: anti_join
+columns:
+  - name: source_system
+    primary_key: true
+  - name: order_number
+    primary_key: true
+```
+
+renders (statements per run):
+
+```sql
+CREATE OR REPLACE TEMPORARY VIEW __bruin_tmp_x AS <your query>;
+INSERT INTO reporting.orders
+SELECT src.* FROM __bruin_tmp_x src
+LEFT ANTI JOIN (SELECT source_system, order_number FROM reporting.orders) tgt
+  ON src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number;
+DROP VIEW IF EXISTS __bruin_tmp_x;
+```
+
+**Combined** — on large targets, a full-table anti join gets expensive. Add
+`incremental_key` + `time_granularity` to bound the *target side* of the
+anti join to the run's datetime window:
+
+```yaml
+materialization:
+  type: table
+  strategy: anti_join
+  incremental_key: order_ts
+  time_granularity: timestamp
+```
+
+The target scan becomes `WHERE order_ts BETWEEN '{{start_timestamp}}' AND
+'{{end_timestamp}}'`, so the join only shuffles the window's keys. Trade-off:
+deduplication is only guaranteed against rows whose `incremental_key` falls
+inside the window — use the unbounded form when late-arriving duplicates
+across windows are possible. `--full-refresh` rebuilds the table via
+`create+replace` as usual. See
+[`examples/fabric_lakehouse/assets/orders_landing.sql`](examples/fabric_lakehouse/assets/orders_landing.sql).
 
 ## Design notes (vs. dbt-fabricspark)
 

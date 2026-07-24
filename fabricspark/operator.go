@@ -88,7 +88,11 @@ func (o BasicOperator) RunTask(ctx context.Context, p *pipeline.Pipeline, t *pip
 		return err
 	}
 
-	if t.Materialization.Strategy == pipeline.MaterializationStrategyTimeInterval {
+	// Both time_interval and window-bounded anti_join emit {{start_*}} /
+	// {{end_*}} placeholders that must be rendered against the run window.
+	needsWindowRendering := t.Materialization.Strategy == pipeline.MaterializationStrategyTimeInterval ||
+		(t.Materialization.Strategy == MaterializationStrategyAntiJoin && t.Materialization.IncrementalKey != "")
+	if needsWindowRendering {
 		materializedQueries, err = extractor.ReextractQueriesFromSlice(materializedQueries)
 		if err != nil {
 			return err

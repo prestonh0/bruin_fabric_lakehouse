@@ -17,6 +17,19 @@ type (
 	AssetMaterializationMap = map[pipeline.MaterializationType]map[pipeline.MaterializationStrategy]MaterializerFunc
 )
 
+// MaterializationStrategyAntiJoin is a connector-specific strategy: it
+// appends only the rows from the query that do not already exist in the
+// target, matched via LEFT ANTI JOIN on the (possibly compound) business key
+// formed by the asset's `primary_key` columns. Unlike `merge` it never
+// updates existing rows, so it stays a pure, idempotent insert.
+//
+// When `incremental_key` and `time_granularity` are also set, the target side
+// of the anti join is restricted to the pipeline's run window (the same
+// {{start_*}}/{{end_*}} placeholders as `time_interval`), which keeps the
+// join cheap on large tables — at the cost of only deduplicating against
+// rows whose incremental_key falls inside that window.
+const MaterializationStrategyAntiJoin = pipeline.MaterializationStrategy("anti_join")
+
 var matMap = AssetMaterializationMap{
 	pipeline.MaterializationTypeView: {
 		pipeline.MaterializationStrategyNone:          viewMaterializer,
@@ -35,6 +48,7 @@ var matMap = AssetMaterializationMap{
 		pipeline.MaterializationStrategyDDL:            buildDDLQuery,
 		pipeline.MaterializationStrategySCD2ByColumn:   scd2NotSupportedMaterializer,
 		pipeline.MaterializationStrategySCD2ByTime:     scd2NotSupportedMaterializer,
+		MaterializationStrategyAntiJoin:                buildAntiJoinQuery,
 	},
 }
 
@@ -144,6 +158,46 @@ func buildCreateReplaceQuery(task *pipeline.Asset, query string) ([]string, erro
 	// so no temp-table dance is needed.
 	return []string{
 		fmt.Sprintf("CREATE OR REPLACE TABLE %s%s%s\nAS %s", task.Name, partitionBy, clusterBy, query),
+	}, nil
+}
+
+func buildAntiJoinQuery(task *pipeline.Asset, query string) ([]string, error) {
+	primaryKeys := task.ColumnNamesWithPrimaryKey()
+	if len(primaryKeys) == 0 {
+		return nil, fmt.Errorf("materialization strategy %s requires the `primary_key` field to be set on at least one column — the primary-key columns form the (compound) business key for the anti join", MaterializationStrategyAntiJoin)
+	}
+
+	mat := task.Materialization
+	if mat.IncrementalKey != "" && mat.TimeGranularity == "" {
+		return nil, fmt.Errorf("materialization strategy %s requires `time_granularity` ('date' or 'timestamp') when `incremental_key` is set, so the target scan can be bounded to the run window", MaterializationStrategyAntiJoin)
+	}
+	if mat.TimeGranularity != "" && mat.TimeGranularity != pipeline.MaterializationTimeGranularityTimestamp && mat.TimeGranularity != pipeline.MaterializationTimeGranularityDate {
+		return nil, fmt.Errorf("time_granularity must be either 'date', or 'timestamp'")
+	}
+
+	// Null-safe equality so business-key columns containing NULLs still
+	// dedupe instead of always re-inserting.
+	on := make([]string, 0, len(primaryKeys))
+	for _, key := range primaryKeys {
+		on = append(on, fmt.Sprintf("src.%s <=> tgt.%s", key, key))
+	}
+
+	keyColumns := strings.Join(primaryKeys, ", ")
+	targetSide := fmt.Sprintf("(SELECT %s FROM %s)", keyColumns, task.Name)
+	if mat.IncrementalKey != "" {
+		startVar, endVar := "{{start_timestamp}}", "{{end_timestamp}}"
+		if mat.TimeGranularity == pipeline.MaterializationTimeGranularityDate {
+			startVar, endVar = "{{start_date}}", "{{end_date}}"
+		}
+		targetSide = fmt.Sprintf("(SELECT %s FROM %s WHERE %s BETWEEN '%s' AND '%s')", keyColumns, task.Name, mat.IncrementalKey, startVar, endVar)
+	}
+
+	tempViewName := "__bruin_tmp_" + helpers.PrefixGenerator()
+
+	return []string{
+		fmt.Sprintf("CREATE OR REPLACE TEMPORARY VIEW %s AS %s", tempViewName, query),
+		fmt.Sprintf("INSERT INTO %s\nSELECT src.* FROM %s src\nLEFT ANTI JOIN %s tgt ON %s", task.Name, tempViewName, targetSide, strings.Join(on, " AND ")),
+		"DROP VIEW IF EXISTS " + tempViewName,
 	}, nil
 }
 

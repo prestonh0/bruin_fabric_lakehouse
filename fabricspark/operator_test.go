@@ -52,7 +52,9 @@ func (f *fakeConnectionGetter) GetConnection(name string) any {
 }
 
 // passthroughExtractor implements query.QueryExtractor without jinja.
-type passthroughExtractor struct{}
+type passthroughExtractor struct {
+	reextractCalls int
+}
 
 func (e *passthroughExtractor) ExtractQueriesFromString(content string) ([]*query.Query, error) {
 	return []*query.Query{{Query: content}}, nil
@@ -63,6 +65,7 @@ func (e *passthroughExtractor) CloneForAsset(_ context.Context, _ *pipeline.Pipe
 }
 
 func (e *passthroughExtractor) ReextractQueriesFromSlice(content []string) ([]string, error) {
+	e.reextractCalls++
 	return content, nil
 }
 
@@ -132,6 +135,43 @@ func TestBasicOperatorRejectsWrongConnectionType(t *testing.T) {
 	err := operator.RunTask(context.Background(), p, asset)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a fabric spark connection")
+}
+
+func TestBasicOperatorAntiJoinRendersRunWindow(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeClient{}
+	conn := &fakeConnectionGetter{connections: map[string]any{"fabric-spark-default": client}}
+	extractor := &passthroughExtractor{}
+	operator := NewBasicOperator(conn, extractor, NewMaterializer(false))
+
+	asset := &pipeline.Asset{
+		Name:       "reporting.orders",
+		Type:       AssetTypeFabricSparkQuery,
+		Connection: "fabric-spark-default",
+		ExecutableFile: pipeline.ExecutableFile{
+			Content: "SELECT * FROM staging.orders",
+		},
+		Materialization: pipeline.Materialization{
+			Type:            pipeline.MaterializationTypeTable,
+			Strategy:        MaterializationStrategyAntiJoin,
+			IncrementalKey:  "order_ts",
+			TimeGranularity: pipeline.MaterializationTimeGranularityTimestamp,
+		},
+		Columns: []pipeline.Column{
+			{Name: "source_system", PrimaryKey: true},
+			{Name: "order_number", PrimaryKey: true},
+		},
+	}
+	p := &pipeline.Pipeline{Name: "my-pipeline", Assets: []*pipeline.Asset{asset}}
+
+	require.NoError(t, operator.RunTask(context.Background(), p, asset))
+
+	// A window-bounded anti join must go through placeholder re-rendering.
+	assert.Equal(t, 1, extractor.reextractCalls)
+	require.Len(t, client.queries, 3)
+	assert.Contains(t, client.queries[1], "LEFT ANTI JOIN")
+	assert.Contains(t, client.queries[1], "src.source_system <=> tgt.source_system AND src.order_number <=> tgt.order_number")
 }
 
 func TestPySparkOperatorRunTask(t *testing.T) {
